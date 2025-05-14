@@ -196,6 +196,7 @@ class RideSharingEnvironment:
         self.time = 0
         self.canceled_passengers = 0
         self.rebalancing_count = 0
+        self.old_rebalance = 0
         self.total_passenger_id = 0
         self.matched_passengers = 0
         self.dropped_passengers = 0
@@ -206,15 +207,10 @@ class RideSharingEnvironment:
 
         self.matched_ids = set()
         self.canceled_ids = set()
-        self.dropped_ids = set()
 
         self.base_fare = 1
         self.VOT = 1.0
-        self.matched_reward = 0.0
-        self.dropoff_reward = 0.0
-        self.qos_reward = 0.0
-        self.rebalancing_reward = 0.0
-        self.emission_reward = 0.0
+
 
     def initialize_vehicles(self, capacity, vehicle_position):
         vehicle = []
@@ -304,18 +300,22 @@ class RideSharingEnvironment:
         차량 v_idx에 대해 단일 action 적용, 반환 보상
         """
         vehicle = self.vehicles[v_idx]
-        r = 0.0
+
+        step_matched = 0
+        qos_reward = 0.0
+
         if action['action_type'] == ActionType.REJECT:
             pass
 
         elif action['action_type'] == ActionType.MATCHING:
             p_idx = action['discrete_index']
             if 0 <= p_idx < len(self.passengers):
-                passenger = self.passengers[p_idx]
-                if passenger.pickup_time is None:
-                    passenger.pickup_time = self.time
-                    vehicle.add_passenger(passenger)
-                    r += self.base_fare
+                p = self.passengers[p_idx]
+                if p.pickup_time is None:
+                    p.pickup_time = self.time
+                    vehicle.add_passenger(p)
+                    self.matched_ids.add(p.id)
+                    step_matched += 1
 
         elif action['action_type'] == ActionType.REBALANCING:
             cont = action['parameter'][0]
@@ -323,13 +323,53 @@ class RideSharingEnvironment:
             mapped = int(np.round(((cont + 1) / 2) * (max_node - 1))) + 1
             vehicle.rebalance_target = mapped
             vehicle.status = 'rebalance'
-            r -= 1
-        return r
+            self.rebalancing_count += 1
+
+        dropped = vehicle.move_to_next_location()
+        # status 갱신
+        if dropped:
+            vehicle.status = 'dropoff'
+        elif vehicle.passengers:
+            vehicle.status = 'moving'
+        else:
+            vehicle.status = 'idle'
+
+        for p in list(self.passengers):
+            if p.start == vehicle.current_location and p.pickup_time is None:
+                if vehicle.add_passenger(p):
+                    p.pickup_time = self.time
+                    self.matched_ids.add(p.id)
+                    step_matched += 1
+                    self.passengers.remove(p)
+                    vehicle.status = 'pickup'
+
+        cumulative = len(self.matched_ids) + len(self.canceled_ids) + len(self.passengers)
+        matched_ratio = len(self.matched_ids) / cumulative if cumulative > 0 else 0
+        matched_reward = step_matched * self.base_fare * matched_ratio
+
+        step_drop = len(dropped)
+        dropoff_ratio = (self.dropped_passengers / len(self.matched_ids)
+                         if len(self.matched_ids) > 0 else 0)
+        dropoff_reward = step_drop * self.base_fare * 1.2 * dropoff_ratio
+
+        for p in dropped:
+            if p.pickup_time is not None and p.dropoff_time == self.time:
+                t_wait = max(0, p.pickup_time - p.request_time)
+                trav = p.dropoff_time - p.pickup_time
+                detour = max(0, trav - p.direct_route_time)
+                qos_reward -= (t_wait + detour)
+
+        rebalancing_in_this_step = self.rebalancing_count - self.old_rebalance
+        rebalance_reward = - rebalancing_in_this_step
+
+        moving_vehicles = sum(1 for v in self.vehicles if v.remaining_travel_time > 0)
+        emmision_reward = - moving_vehicles
+
+        reward = matched_reward + dropoff_reward + qos_reward + rebalance_reward + emmision_reward
+
+        return reward
 
     def step(self, agent):
-        old_rebalancing = self.rebalancing_count
-        step_matched = 0
-
         if self.time <= self.max_request_time:
             new = self.passengers_data[self.passengers_data['Request_time'] == self.time]
             existing = {p.id for p in self.passengers}
@@ -346,14 +386,14 @@ class RideSharingEnvironment:
                 self.passengers.remove(p)
         self.canceled_passengers = len(self.canceled_ids)
 
-        all_dropped = []
         n_v = len(self.vehicles)
+        self.old_rebalance = self.rebalancing_count
         total_reward = 0.0
         assigned = set()
         actions = [None]*n_v
 
         state = self.get_state()
-        flat_requests = state['requests'].flatten()
+        flat_state = self.flatten_state(state).reshape(1, -1)
 
         for _ in range(n_v):
             # 남은 차량 리스트
@@ -366,7 +406,7 @@ class RideSharingEnvironment:
                 # 나머지 차량 마스킹
                 mask = [i for i in range(n_v) if i!=v_idx]
                 V[mask] = 0.0
-                batch.append( np.concatenate([V.flatten(), flat_requests]) )
+                batch.append(np.concatenate([V.flatten(), state['requests'].flatten()]))
             batch = tf.convert_to_tensor(np.stack(batch), dtype=tf.float32)
 
             # 한 번에 예측
@@ -389,9 +429,6 @@ class RideSharingEnvironment:
                 param = out['p_rebalance'].numpy()[veh_i][r]
                 act = {'action_type':ActionType.REBALANCING,'discrete_index':r,'parameter':param}
 
-            actions[v_idx] = act
-            assigned.add(v_idx)
-
             if act['action_type'] == ActionType.REBALANCING:
                 cont = act['parameter'][0]
                 max_n = len(self.network.graph.nodes)
@@ -402,62 +439,22 @@ class RideSharingEnvironment:
                 self.rebalancing_count += 1
 
             # 적용
-            total_reward += self.single_action(v_idx, act)
+            r = self.single_action(v_idx, act)
+            total_reward += r
             actions[v_idx] = act
             assigned.add(v_idx)
 
-            state = self.get_state()
-            flat_requests = state['requests'].flatten()
+            next_state = self.get_state()
+            flat_next = self.flatten_state(next_state).reshape(1, -1)
 
-        for v in self.vehicles:
-            dropped = v.move_to_next_location()
-            all_dropped.extend(dropped)
-            # 상태 갱신
-            if dropped:
-                v.status = 'dropoff'
-            elif v.passengers:
-                v.status = 'moving'
-            else:
-                v.status = 'idle'
+            agent.remember(flat_state, [act], r, flat_next, done=False)
+            agent.replay()
 
-            for p in list(self.passengers):
-                if p.start == v.current_location and p.pickup_time is None:
-                    if v.add_passenger(p):
-                        p.pickup_time = self.time
-                        self.matched_ids.add(p.id)
-                        step_matched += 1
-                        self.passengers.remove(p)
-                        v.status = 'pickup'
+            state = next_state
+            flat_state = flat_next
 
-        # matched_ratio = len(self.matched_ids) / (
-        #         len(self.matched_ids) + len(self.canceled_ids) + len(self.passengers)
-        # ) if (len(self.matched_ids) + len(self.canceled_ids) + len(self.passengers)) > 0 else 0
-        # self.matched_reward = step_matched * self.base_fare * matched_ratio
-        #
-        # dropoff_ratio = (self.dropped_passengers / len(self.matched_ids)
-        #                  if len(self.matched_ids) > 0 else 0)
-        # step_drop = len(all_dropped)
-        # self.dropoff_reward = step_drop * self.base_fare * 1.2 * dropoff_ratio
-        #
-        # self.qos_reward = 0.0
-        # for p in all_dropped:
-        #     if p.pickup_time is not None and p.dropoff_time == self.time:
-        #         t_wait = max(0, p.pickup_time - p.request_time)
-        #         trav = p.dropoff_time - p.pickup_time
-        #         detour = max(0, trav - p.direct_route_time)
-        #         self.qos_reward -= (t_wait + detour)
-        #
-        # self.rebalancing_reward = -(self.rebalancing_count - old_rebalancing)
-        # moving = sum(1 for v in self.vehicles if v.remaining_travel_time > 0)
-        # self.emission_reward = - moving
-        #
-        # total_reward = (self.matched_reward + self.dropoff_reward +
-        #                 self.qos_reward + self.rebalancing_reward +
-        #                 self.emission_reward)
 
         self.time += 1
-        self.last_dropped = all_dropped
-
         return total_reward, actions
 
 #########################################################
@@ -490,7 +487,7 @@ class DQNAgent:
         self.epsilon_decay = 0.995
         self.batch_size = 32
 
-        self.memory = deque(maxlen=10000)
+        self.memory = deque(maxlen=20000)
 
         self.model = self.build_model()
         self.target_model = self.build_model()
@@ -668,12 +665,12 @@ def main():
     agent = DQNAgent(state_size)
     agent.load_model(weight_path)
 
-    episode_logs = []
     logs = []
     episodes = 500
     sec= 60
 
     for ep in range(episodes):
+        episode_logs = []
         env = RideSharingEnvironment(
             network=network,
             capacity=5,
@@ -682,12 +679,8 @@ def main():
         )
         total_reward = 0.0
 
-        # 초기 상태
-        S = env.get_state()
-        flat = env.flatten_state(S).reshape(1, -1)
-
         for t in range(sec):
-            # 빈 차량 재배치 목표 (기존 로직)
+            # 빈 차량 재배치 목표
             for v in env.vehicles:
                 if not v.passengers:
                     hd = env.get_high_demand_nodes()
@@ -702,22 +695,12 @@ def main():
             reward, actions = env.step(agent)
             total_reward += reward
 
-            S_next = env.get_state()
-            flat_next = env.flatten_state(S_next).reshape(1, -1)
-            done = (t == sec - 1)
-
-            agent.remember(flat, actions, reward, flat_next, done)
-            loss = agent.replay()
-
             episode_logs.append({
                 "Step": t + 1,
                 "Reward": total_reward,
-                "Loss": loss,
                 "Matched Passengers": len(env.matched_ids),
                 "Canceled Passengers": len(env.canceled_ids)
             })
-
-            flat = flat_next
 
         logs.append({
             "Episode": ep + 1,
