@@ -190,7 +190,8 @@ class RideSharingEnvironment:
     def __init__(self, network, capacity, passenger_data, vehicle_positions):
         self.network = network
         self.vehicles = self.initialize_vehicles(capacity, vehicle_positions)
-        self.passengers = self.initialize_passengers(passenger_data)
+        # self.passengers = self.initialize_passengers(passenger_data)
+        self.passengers = []
         self.passengers_data = passenger_data
         # 기존 환경 변수
         self.time = 0
@@ -218,18 +219,18 @@ class RideSharingEnvironment:
             vehicle.append(Vehicle(idx, capacity, pos, self.network, self))
         return vehicle
 
-    def initialize_passengers(self, passenger_data):
-        passengers = []
-        for _, row in passenger_data.iterrows():
-            passenger = Passenger(
-                id = row['User_ID'],
-                start = row['Start_node'],
-                end = row['End_node'],
-                request_time = row['Request_time'],
-                network=self.network
-            )
-            passengers.append(passenger)
-        return passengers
+    # def initialize_passengers(self, passenger_data):
+    #     passengers = []
+    #     for _, row in passenger_data.iterrows():
+    #         passenger = Passenger(
+    #             id = row['User_ID'],
+    #             start = row['Start_node'],
+    #             end = row['End_node'],
+    #             request_time = row['Request_time'],
+    #             network=self.network
+    #         )
+    #         passengers.append(passenger)
+    #     return passengers
 
     def get_high_demand_nodes(self):
         recent_requests = [p.start for p in self.passengers if self.time - p.request_time <= 10]
@@ -316,6 +317,8 @@ class RideSharingEnvironment:
                     vehicle.add_passenger(p)
                     self.matched_ids.add(p.id)
                     step_matched += 1
+                    self.passengers.remove(p)
+                    self.waiting_passenger_count[p.start] -= 1
 
         elif action['action_type'] == ActionType.REBALANCING:
             cont = action['parameter'][0]
@@ -624,7 +627,7 @@ class DQNAgent:
             self.epsilon *= self.epsilon_decay
 
         self.target_update_counter += 1
-        if self.target_update_counter % 50 == 0:
+        if self.target_update_counter % 100 == 0:
             self.update_target_model()
 
         return loss
@@ -665,19 +668,22 @@ def main():
     agent = DQNAgent(state_size)
     agent.load_model(weight_path)
 
-    logs = []
+    episode_logs = []
     episodes = 500
     sec= 60
 
     for ep in range(episodes):
-        episode_logs = []
+        step_logs = []
         env = RideSharingEnvironment(
             network=network,
             capacity=5,
             passenger_data=passenger_data,
             vehicle_positions=vehicle_positions
         )
+
         total_reward = 0.0
+        total_loss = 0.0
+        prev_dropped = 0
 
         for t in range(sec):
             # 빈 차량 재배치 목표
@@ -695,29 +701,53 @@ def main():
             reward, actions = env.step(agent)
             total_reward += reward
 
-            episode_logs.append({
+            loss = agent.replay()
+            if loss is None:
+                loss = 0.0
+            total_loss += loss
+
+            dropped_this_step = env.dropped_passengers - prev_dropped
+            prev_dropped = env.dropped_passengers
+
+            waiting = sum(1 for p in env.passengers if p.pickup_time is None)
+
+            matched = len(env.matched_ids)
+            canceled = len(env.canceled_ids)
+            total_accounted = matched + canceled + waiting
+
+            step_logs.append({
                 "Step": t + 1,
-                "Reward": total_reward,
-                "Matched Passengers": len(env.matched_ids),
-                "Canceled Passengers": len(env.canceled_ids)
+                "Total Reward": total_reward,
+                "Loss": loss,
+                "Matched Passengers": matched,
+                "Canceled": canceled,
+                "Dropped Passengers": dropped_this_step,
+                "Waiting Passengers": waiting,
+                "Total Accounted Passengers": total_accounted,
+                "Rebalancing Count": env.rebalancing_count
             })
 
-        logs.append({
+        waiting_end = sum(1 for p in env.passengers if p.pickup_time is None)
+        episode_logs.append({
             "Episode": ep + 1,
-            "Reward": total_reward,
+            "Total Reward": total_reward,
+            "Loss": total_loss,
             "Matched Passengers": len(env.matched_ids),
-            "Canceled Passengers": len(env.canceled_ids)
+            "Canceled": len(env.canceled_ids),
+            "Dropped Passengers": env.dropped_passengers,
+            "Waiting Passengers": waiting_end,
+            "Total Accounted Passengers": len(env.matched_ids) + len(env.canceled_ids) + waiting_end,
+            "Rebalancing Count": env.rebalancing_count
         })
 
-        print(f"Episode: {ep + 1}  Total Reward:{total_reward:.2f}")
-        epi_df = pd.DataFrame(episode_logs)
-        epi_df.to_csv(os.path.join(episode_dir, f"{ep + 1} result.csv"), index=False)
-        episode_logs = []
+        print(f"Episode: {ep + 1}  Total Reward: {total_reward:.2f}  Total Loss: {total_loss:.4f}")
+        step_df = pd.DataFrame(step_logs)
+        step_df.to_csv(os.path.join(episode_dir, f"{ep + 1} episode result.csv"), index=False)
         if ep == episodes - 1:
             final_model_path = os.path.join(result_dir, f"dqn_model_weights_final.weight.h5")
             agent.save_model(final_model_path)
 
-    df = pd.DataFrame(logs)
+    df = pd.DataFrame(episode_logs)
     df.to_csv(os.path.join(result_dir, "results.csv"), index=False)
     print("DQN training completed.")
 
