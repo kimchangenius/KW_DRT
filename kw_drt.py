@@ -12,6 +12,10 @@ import json
 from pprint import pprint
 import enum
 
+from tensorflow.python.distribute.combinations import tf_function
+from tensorflow.python.keras.utils.version_utils import training
+from tensorflow.python.ops.gen_batch_ops import batch
+
 
 #########################################################
 # SiouxFallsNetwork
@@ -133,6 +137,7 @@ class Vehicle:
         self.env = env
         self.passengers = []
         self.status = 'idle'
+        self.current_request = None
 
         # 기존 환경 변수
         self.remaining_travel_time = 0
@@ -146,6 +151,8 @@ class Vehicle:
         if len(self.passengers) < self.capacity:
             self.passengers.append(passenger)
             self.idle_time = 0
+            self.status = self.env.status_map.get(self.status, 2)
+            self.current_request = {'type': 'pickup', 'passenger_id': passenger.id}
             return True
         return False
 
@@ -212,6 +219,7 @@ class RideSharingEnvironment:
         self.base_fare = 1
         self.VOT = 1.0
 
+        self.status_map = {'idle': 0, 'reject': 1, 'pickup': 2, 'dropoff': 3, 'rebalance': 4}
 
     def initialize_vehicles(self, capacity, vehicle_position):
         vehicle = []
@@ -267,14 +275,13 @@ class RideSharingEnvironment:
         """
         # 차량 상태 V_t
         vehicle_features = []
-        status_map = {'idle': 0, 'moving': 1, 'pickup': 2, 'dropoff': 3, 'rebalance': 4}
         for v in self.vehicles:
             next_node = v.current_path[0] if v.current_path else -1
             vehicle_features.append([
                 v.current_location,
                 next_node,
                 v.capacity - len(v.passengers),
-                status_map.get(v.status, 0),
+                self.status_map.get(v.status, 0),
                 v.rebalance_target or -1
             ])
         vehicle_array = np.array(vehicle_features, dtype=float)
@@ -306,7 +313,8 @@ class RideSharingEnvironment:
         qos_reward = 0.0
 
         if action['action_type'] == ActionType.REJECT:
-            pass
+            self.status_map.get(vehicle.status, 1)
+            vehicle.current_request = {'type': 'reject'}
 
         elif action['action_type'] == ActionType.MATCHING:
             p_idx = action['discrete_index']
@@ -320,22 +328,52 @@ class RideSharingEnvironment:
                     self.passengers.remove(p)
                     self.waiting_passenger_count[p.start] -= 1
 
+                    path_to_pickup = self.network.get_shortest_path(
+                        vehicle.current_location, p.start
+                    )
+                    path_to_dropoff = self.network.get_shortest_path(
+                        p.start, p.end
+                    )
+                    full_path = path_to_pickup + path_to_dropoff[1:]
+                    vehicle.current_path = full_path
+
+                    if len(full_path) > 1:
+                        vehicle.remaining_travel_time = self.network.get_travel_time(
+                            [full_path[0], full_path[1]]
+                        )
+                    else:
+                        vehicle.remaining_travel_time = 0
+
+                    self.status_map.get(vehicle.status, 2)
+                    vehicle.current_request = {'type': 'pickup', 'passenger_id': p.id}
+
+
         elif action['action_type'] == ActionType.REBALANCING:
-            cont = action['parameter'][0]
-            max_node = len(self.network.graph.nodes)
-            mapped = int(np.round(((cont + 1) / 2) * (max_node - 1))) + 1
-            vehicle.rebalance_target = mapped
-            vehicle.status = 'rebalance'
+            high_nodes = self.get_high_demand_nodes()
+            r = action['discrete_index']
+            target = high_nodes[r]
+            vehicle.rebalance_target = target
+
+            full_path = self.network.get_shortest_path(
+                vehicle.current_location, target
+            )
+            vehicle.current_path = full_path
+            if len(full_path) > 1:
+                vehicle.remaining_travel_time = self.network.get_travel_time(
+                    [full_path[0], full_path[1]]
+                )
+            else:
+                vehicle.remaining_travel_time = 0
+
+            self.status_map.get(vehicle.status, 4)
+            vehicle.current_request = {'type': 'rebalance', 'target': target}
             self.rebalancing_count += 1
 
         dropped = vehicle.move_to_next_location()
-        # status 갱신
         if dropped:
-            vehicle.status = 'dropoff'
-        elif vehicle.passengers:
-            vehicle.status = 'moving'
-        else:
-            vehicle.status = 'idle'
+            self.status_map.get(vehicle.status, 3)
+            vehicle.current_request = {'type': 'dropoff',
+                                       'passenger_ids': [p.id for p in dropped]}
 
         for p in list(self.passengers):
             if p.start == vehicle.current_location and p.pickup_time is None:
@@ -344,7 +382,7 @@ class RideSharingEnvironment:
                     self.matched_ids.add(p.id)
                     step_matched += 1
                     self.passengers.remove(p)
-                    vehicle.status = 'pickup'
+                    self.status_map.get(vehicle.status, 2)
 
         cumulative = len(self.matched_ids) + len(self.canceled_ids) + len(self.passengers)
         matched_ratio = len(self.matched_ids) / cumulative if cumulative > 0 else 0
@@ -362,103 +400,27 @@ class RideSharingEnvironment:
                 detour = max(0, trav - p.direct_route_time)
                 qos_reward -= (t_wait + detour)
 
-        rebalancing_in_this_step = self.rebalancing_count - self.old_rebalance
-        rebalance_reward = - rebalancing_in_this_step
+        # moving_vehicles = sum(1 for v in self.vehicles if v.remaining_travel_time > 0)
+        # emmision_reward = - moving_vehicles
 
-        moving_vehicles = sum(1 for v in self.vehicles if v.remaining_travel_time > 0)
-        emmision_reward = - moving_vehicles
+        reward = matched_reward + dropoff_reward + qos_reward
 
-        reward = matched_reward + dropoff_reward + qos_reward + rebalance_reward + emmision_reward
-
+        # reward = np.clip(reward, -5.0, 5.0)
         return reward
 
-    def step(self, agent):
+    def step(self, veh_i, act):
         if self.time <= self.max_request_time:
-            new = self.passengers_data[self.passengers_data['Request_time'] == self.time]
-            existing = {p.id for p in self.passengers}
-            for _, row in new.iterrows():
-                if row['User_ID'] not in existing:
-                    p = Passenger(row['User_ID'], row['Start_node'], row['End_node'], row['Request_time'], self.network)
-                    self.passengers.append(p)
-                    self.waiting_passenger_count[p.start] += 1
-
+            self.generate_passengers_for_current_time()
         cancel_limit = 10
         for p in list(self.passengers):
             if p.pickup_time is None and (self.time - p.request_time) > cancel_limit:
                 self.canceled_ids.add(p.id)
                 self.passengers.remove(p)
-        self.canceled_passengers = len(self.canceled_ids)
 
-        n_v = len(self.vehicles)
-        self.old_rebalance = self.rebalancing_count
-        total_reward = 0.0
-        assigned = set()
-        actions = [None]*n_v
+        reward = self.single_action(veh_i, act)
 
-        state = self.get_state()
-        flat_state = self.flatten_state(state).reshape(1, -1)
-
-        for _ in range(n_v):
-            # 남은 차량 리스트
-            remaining = [i for i in range(n_v) if i not in assigned]
-
-            # 배치용 입력 생성
-            batch = []
-            for v_idx in remaining:
-                V = state['vehicles'].copy()
-                # 나머지 차량 마스킹
-                mask = [i for i in range(n_v) if i!=v_idx]
-                V[mask] = 0.0
-                batch.append(np.concatenate([V.flatten(), state['requests'].flatten()]))
-            batch = tf.convert_to_tensor(np.stack(batch), dtype=tf.float32)
-
-            # 한 번에 예측
-            out = agent.model(batch, training=False)
-            Q = out['q_all'].numpy()           # shape (len(remaining), total_actions)
-            best_flat = Q.reshape(-1).argmax()  # 전체에서 best
-            veh_i = best_flat // agent.total_actions
-            act_i = best_flat % agent.total_actions
-
-            v_idx = remaining[veh_i]
-            # 액션 dict 생성
-            if act_i < agent.num_reject:
-                act = {'action_type':ActionType.REJECT,'discrete_index':0,'parameter':None}
-            elif act_i < agent.num_reject+agent.num_matching:
-                m = act_i - agent.num_reject
-                param = out['p_matching'].numpy()[veh_i][m]
-                act = {'action_type':ActionType.MATCHING,'discrete_index':m,'parameter':param}
-            else:
-                r = act_i - agent.num_reject - agent.num_matching
-                param = out['p_rebalance'].numpy()[veh_i][r]
-                act = {'action_type':ActionType.REBALANCING,'discrete_index':r,'parameter':param}
-
-            if act['action_type'] == ActionType.REBALANCING:
-                cont = act['parameter'][0]
-                max_n = len(self.network.graph.nodes)
-                mapped = int(np.round(((cont + 1) / 2) * (max_n - 1))) + 1
-                v = self.vehicles[v_idx]
-                v.rebalance_target = mapped
-                v.status = 'rebalance'
-                self.rebalancing_count += 1
-
-            # 적용
-            r = self.single_action(v_idx, act)
-            total_reward += r
-            actions[v_idx] = act
-            assigned.add(v_idx)
-
-            next_state = self.get_state()
-            flat_next = self.flatten_state(next_state).reshape(1, -1)
-
-            agent.remember(flat_state, [act], r, flat_next, done=False)
-            agent.replay()
-
-            state = next_state
-            flat_state = flat_next
-
-
-        self.time += 1
-        return total_reward, actions
+        next_state = self.get_state()
+        return reward, next_state
 
 #########################################################
 # DQN Agent
@@ -469,7 +431,7 @@ class ActionType(enum.Enum):
     REBALANCING = 2
 
 class DQNAgent:
-    def __init__(self, state_size):
+    def __init__(self, state_size, max_episodes=500):
         self.state_size = state_size
 
         self.num_reject = 1
@@ -486,8 +448,9 @@ class DQNAgent:
 
         self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_min = 0.05
+        self.epsilon_min = 0.1
         self.epsilon_decay = 0.995
+        self.epsilon_delta = (self.epsilon - self.epsilon_min) / max_episodes
         self.batch_size = 32
 
         self.memory = deque(maxlen=20000)
@@ -497,6 +460,8 @@ class DQNAgent:
         self.update_target_model()
         self.target_update_counter = 0
         self.train_counter = 0
+        self.target_update_freq = 1000
+
 
     def update_target_model(self):
         self.target_model.set_weights(self.model.get_weights())
@@ -519,118 +484,131 @@ class DQNAgent:
         x = Dense(128, activation='relu')(x)
 
         q_reject = Dense(self.num_reject, activation='linear', name='q_reject')(x)
-
         q_matching = Dense(self.num_matching, activation='linear', name='q_matching')(x)
-        p_matching = Dense(self.num_matching * self.param_dim_matching,
-                           activation='tanh', name='p_matching')(x)
-        p_matching = Reshape((self.num_matching, self.param_dim_matching),
-                             name='p_matching_reshape')(p_matching)
-
         q_rebalance = Dense(self.num_rebalancing, activation='linear', name='q_rebalance')(x)
-        p_rebalance = Dense(self.num_rebalancing * self.param_dim_rebalancing,
-                            activation='tanh', name='p_rebalance')(x)
-        p_rebalance = Reshape((self.num_rebalancing, self.param_dim_rebalancing),
-                              name='p_rebalance_reshape')(p_rebalance)
+
 
         q_all = Concatenate(name='q_all')(
             [q_reject, q_matching, q_rebalance]
         )
 
-        model = Model(inputs=state, outputs={
-            'q_all': q_all,
-            'p_matching': p_matching,
-            'p_rebalance': p_rebalance
-        })
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                      loss='mse')
+        model = Model(inputs=state, outputs=q_all)
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=5e-5,
+            clipnorm=0.5
+        )
+        model.compile(
+            optimizer=optimizer,
+            loss='huber'
+        )
         return model
 
-    def act(self, state):
-        if np.random.rand() <= self.epsilon:
+    @tf_function
+    def predict_q_all(self, states: tf.Tensor) -> tf.Tensor:
+        return self.model(states, training=False)
+
+    @tf_function
+    def predict_target_q_all(self, states: tf.Tensor) -> tf.Tensor:
+        return self.target_model(states, training=False)
+
+    def act(self, flat_states: np.ndarray, vehicles: list):
+        batch = tf.convert_to_tensor(flat_states, dtype=tf.float32)
+        q_all = self.predict_q_all(batch).numpy()
+
+        for i, v in enumerate(vehicles):
+            if v.status != 'idle':
+                q_all[i, :] = -np.inf
+
+        valid = [i for i, v in enumerate(vehicles) if v.status == 'idle']
+        if np.random.rand() < self.epsilon:
+            veh_i = random.choice(valid)
             idx = random.randrange(self.total_actions)
-            if idx < self.num_reject:
-                return {'action_type': ActionType.REJECT,
-                        'discrete_index': 0, 'parameter': None}
-            elif idx < self.num_reject + self.num_matching:
-                m = idx - self.num_reject
-                p = np.random.uniform(-1, 1, self.param_dim_matching)
-                return {'action_type': ActionType.MATCHING,
-                        'discrete_index': m, 'parameter': p}
-            else:
-                r = idx - self.num_reject - self.num_matching
-                p = np.random.uniform(-1, 1, self.param_dim_rebalancing)
-                return {'action_type': ActionType.REBALANCING,
-                        'discrete_index': r, 'parameter': p}
-
-        tensor = tf.convert_to_tensor(state, dtype=tf.float32)
-        out = self.model(tensor, training=False)
-        q_all = out['q_all'].numpy()[0]
-        p_m = out['p_matching'].numpy()[0]
-        p_r = out['p_rebalance'].numpy()[0]
-        best = np.argmax(q_all)
-
-        if best < self.num_reject:
-            return {'action_type': ActionType.REJECT,
-                    'discrete_index': 0, 'parameter': None}
-        elif best < self.num_reject + self.num_matching:
-            m = best - self.num_reject
-            return {'action_type': ActionType.MATCHING,
-                    'discrete_index': m, 'parameter': p_m[m]}
         else:
-            r = best - self.num_reject - self.num_matching
-            return {'action_type': ActionType.REBALANCING,
-                    'discrete_index': r, 'parameter': p_r[r]}
+            flat_q = q_all.reshape(-1)
+            best_flat = int(np.argmax(flat_q))
+            veh_i = best_flat // self.total_actions
+            idx = best_flat % self.total_actions
+
+        if idx < self.num_reject:
+            act = {
+                'action_type': ActionType.REJECT,
+                'discrete_index': 0,
+                'parameter': None
+            }
+        elif idx < self.num_reject + self.num_matching:
+            act = {
+                'action_type': ActionType.MATCHING,
+                'discrete_index': idx - self.num_reject,
+                'parameter': None
+            }
+        else:
+            act = {
+                'action_type': ActionType.REBALANCING,
+                'discrete_index': idx - self.num_reject - self.num_matching,
+                'parameter': None
+            }
+
+        return veh_i, act
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
 
     def replay(self):
         self.train_counter += 1
+        # 매 5스텝마다, 메모리가 충분할 때만 학습
         if self.train_counter % 5 != 0 or len(self.memory) < self.batch_size:
             return
 
         batch = random.sample(self.memory, self.batch_size)
-        loss = 0.0
+        losses = []
+
         for state, action_list, reward, next_state, done in batch:
-            # 1) next Q 계산 (target network)
-            next_tensor = tf.convert_to_tensor(next_state, dtype=tf.float32)
-            out_n = self.target_model(next_tensor, training=False)
-            q_next = out_n['q_all'].numpy()[0]
-            target = reward + (0 if done else self.gamma * np.max(q_next))
+            # 0) 텐서 준비 (batch size=1)
+            st_t = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
+            nxt_t = tf.convert_to_tensor(next_state.reshape(1, -1), dtype=tf.float32)
 
-            # 2) current Q 계산 (online network)
-            state_tensor = tf.convert_to_tensor(state, dtype=tf.float32)
-            out_c = self.model(state_tensor, training=False)
-            q_all = out_c['q_all'].numpy()[0]
+            # 1) online 네트워크로부터 next Q 선택용
+            q_next_on = self.predict_q_all(nxt_t).numpy().reshape(-1)  # shape=(A,)
+            a_max = int(np.argmax(q_next_on))
 
-            # 3) Q 업데이트
+            # 2) target 네트워크로부터 next Q 평가용
+            q_next_tg = self.predict_target_q_all(nxt_t).numpy().reshape(-1)
+            max_q_next = float(q_next_tg[a_max])
+
+            # 3) 벨만 타깃값
+            target_q_value = reward if done else reward + self.gamma * max_q_next
+
+            # 4) 현재 상태에서 Q값
+            q_current = self.predict_q_all(st_t).numpy().reshape(-1)
+
+            # 5) 실제 취한 action index로 Q 업데이트
             for act in action_list:
                 if act['action_type'] == ActionType.REJECT:
                     idx = 0
                 elif act['action_type'] == ActionType.MATCHING:
                     idx = act['discrete_index'] + self.num_reject
-                else:
+                else:  # REBALANCING
                     idx = act['discrete_index'] + self.num_reject + self.num_matching
-                q_all[idx] = target
+                q_current[idx] = target_q_value
 
-            # 4) train_on_batch
-            target_out = {
-                'q_all': q_all.reshape((1, -1)),
-                'p_matching': out_c['p_matching'].numpy(),
-                'p_rebalance': out_c['p_rebalance'].numpy()
-            }
             loss = self.model.train_on_batch(
-                state_tensor, target_out
-            )[0]
-
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+                st_t,
+                q_current[np.newaxis, :]  # shape=(1, A)
+            )
+            losses.append(loss)
 
         self.target_update_counter += 1
-        if self.target_update_counter % 100 == 0:
+        if self.target_update_counter % self.target_update_freq == 0:
             self.update_target_model()
 
-        return loss
+        return float(np.mean(losses))
+
+    def decay_epsilon(self, ep, episodes):
+        if ep < 100:
+            self.epsilon = 1.0
+        else:
+            self.epsilon = max(self.epsilon_min,
+                               1.0 - (ep - 100) * (1.0 - self.epsilon_min) / (episodes - 100))
 
 
 #########################################################
@@ -651,10 +629,10 @@ def main():
 
     network = SiouxFallsNetwork(net_data, flow_data, node_coord_data, node_xy_data) # create network
 
-    travel_time_output = os.path.join(result_dir, 'travel_time.csv')
+    travel_time_output = os.path.join(data_dir, 'travel_time.csv')
     network.save_travel_time(travel_time_output)
 
-    od_matrix_output = os.path.join(result_dir, 'od_matrix.csv')
+    od_matrix_output = os.path.join(data_dir, 'od_matrix.csv')
     network.generate_od_matrix(od_matrix_output)
 
     print("Simulation setup complete")
@@ -664,13 +642,13 @@ def main():
 
     state_size = len(vehicle_positions) * 5 + 20 * 3
 
-    weight_path = os.path.join(result_dir, "dqn_model_weights_final.weight.h5")
-    agent = DQNAgent(state_size)
-    agent.load_model(weight_path)
 
     episode_logs = []
     episodes = 500
-    sec= 60
+
+    agent = DQNAgent(state_size)
+    weight_path = os.path.join(result_dir, "dqn_model_weights_final.weight.h5")
+    agent.load_model(weight_path)
 
     for ep in range(episodes):
         step_logs = []
@@ -680,52 +658,74 @@ def main():
             passenger_data=passenger_data,
             vehicle_positions=vehicle_positions
         )
-
+        n_v = len(env.vehicles)
         total_reward = 0.0
         total_loss = 0.0
         prev_dropped = 0
+        done = False
 
-        for t in range(sec):
-            # 빈 차량 재배치 목표
+        while not done:
+            st = env.get_state()
+            st = env.flatten_state(st)
+
+            while any(v.status == 'idle' for v in env.vehicles):
+                for v in env.vehicles:
+                    v.mask = False
+                batch_states = np.tile(st, (n_v, 1))
+
+                veh_i, act = agent.act(batch_states, env.vehicles)
+
+                reward, next_state = env.step(veh_i, act)
+                total_reward += reward
+
+                s = np.concatenate([batch_states[veh_i]])
+                s_next = env.flatten_state(next_state)
+                agent.remember(s.reshape(1, -1), [act], reward, s_next.reshape(1, -1), done)
+                loss = agent.replay()
+                if loss is None:
+                    loss = 0.0
+                total_loss += loss
+
+                st = s_next
+
+            env.time += 1
+
             for v in env.vehicles:
-                if not v.passengers:
-                    hd = env.get_high_demand_nodes()
-                    if hd:
-                        v.rebalance_target = min(
-                            hd,
-                            key=lambda nd: nx.shortest_path_length(
-                                env.network.graph, v.current_location, nd, weight="weight"
-                            )
-                        )
+                env.status_map.get(v.status, 0)
 
-            reward, actions = env.step(agent)
-            total_reward += reward
+            done = (env.time >= 60)
+            if done:
+                break
 
-            loss = agent.replay()
-            if loss is None:
-                loss = 0.0
-            total_loss += loss
+        agent.decay_epsilon(ep, episodes)
 
-            dropped_this_step = env.dropped_passengers - prev_dropped
-            prev_dropped = env.dropped_passengers
+            # dropped_this_step = env.dropped_passengers - prev_dropped
+            # prev_dropped = env.dropped_passengers
+            #
+            # waiting = sum(1 for p in env.passengers if p.pickup_time is None)
+            #
+            # matched = len(env.matched_ids)
+            # canceled = len(env.canceled_ids)
+            # total_accounted = matched + canceled + waiting
+            #
+            # step_logs.append({
+            #     "Step": t + 1,
+            #     "Total Reward": total_reward,
+            #     "Loss": loss,
+            #     "Matched Passengers": matched,
+            #     "Canceled": canceled,
+            #     "Dropped Passengers": dropped_this_step,
+            #     "Waiting Passengers": waiting,
+            #     "Total Accounted Passengers": total_accounted,
+            #     "Rebalancing Count": env.rebalancing_count
+            # })
 
-            waiting = sum(1 for p in env.passengers if p.pickup_time is None)
 
-            matched = len(env.matched_ids)
-            canceled = len(env.canceled_ids)
-            total_accounted = matched + canceled + waiting
-
-            step_logs.append({
-                "Step": t + 1,
-                "Total Reward": total_reward,
-                "Loss": loss,
-                "Matched Passengers": matched,
-                "Canceled": canceled,
-                "Dropped Passengers": dropped_this_step,
-                "Waiting Passengers": waiting,
-                "Total Accounted Passengers": total_accounted,
-                "Rebalancing Count": env.rebalancing_count
-            })
+        # if ep < 100:
+        #     agent.epsilon = 1.0
+        # else:
+        #     agent.epsilon = max(agent.epsilon_min,
+        #                         1.0 - (ep - 100) * (1.0 - agent.epsilon_min) / (episodes - 100))
 
         waiting_end = sum(1 for p in env.passengers if p.pickup_time is None)
         episode_logs.append({
