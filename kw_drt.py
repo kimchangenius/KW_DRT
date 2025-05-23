@@ -408,7 +408,7 @@ class RideSharingEnvironment:
         # reward = np.clip(reward, -5.0, 5.0)
         return reward
 
-    def step(self, veh_i, act):
+    def update_current_requirement(self):
         if self.time <= self.max_request_time:
             self.generate_passengers_for_current_time()
         cancel_limit = 10
@@ -417,6 +417,8 @@ class RideSharingEnvironment:
                 self.canceled_ids.add(p.id)
                 self.passengers.remove(p)
 
+    def step(self, veh_i, act):
+        # self.get_current_requirement()
         reward = self.single_action(veh_i, act)
 
         next_state = self.get_state()
@@ -487,7 +489,6 @@ class DQNAgent:
         q_matching = Dense(self.num_matching, activation='linear', name='q_matching')(x)
         q_rebalance = Dense(self.num_rebalancing, activation='linear', name='q_rebalance')(x)
 
-
         q_all = Concatenate(name='q_all')(
             [q_reject, q_matching, q_rebalance]
         )
@@ -515,20 +516,41 @@ class DQNAgent:
         batch = tf.convert_to_tensor(flat_states, dtype=tf.float32)
         q_all = self.predict_q_all(batch).numpy()
 
+        n_v = flat_states.shape[0]
+        req_flat_start = self.state_size - 20 * 3
+        requests_flat = flat_states[:, req_flat_start:]
+        request_times = requests_flat.reshape(n_v, 20, 3)[:, :, 2]
+
+        for i in range(n_v):
+            for m in range(self.num_matching):
+                if request_times[i, m] < 0:
+                    q_all[i, 1 + m] = -np.inf
+
         for i, v in enumerate(vehicles):
             if v.status != 'idle':
                 q_all[i, :] = -np.inf
 
-        valid = [i for i, v in enumerate(vehicles) if v.status == 'idle']
-        if np.random.rand() < self.epsilon:
-            veh_i = random.choice(valid)
-            idx = random.randrange(self.total_actions)
+        idle_idxs = [i for i, v in enumerate(vehicles) if v.status == 'idle']
+        valid_pairs = []
+        for i in idle_idxs:
+            for j, q in enumerate(q_all[i]):
+                if not np.isneginf(q):
+                    valid_pairs.append((i, j))
+
+        # ε-greedy 탐색 or 활용
+        if np.random.rand() < self.epsilon and valid_pairs:
+            veh_i, idx = random.choice(valid_pairs)
         else:
             flat_q = q_all.reshape(-1)
-            best_flat = int(np.argmax(flat_q))
-            veh_i = best_flat // self.total_actions
-            idx = best_flat % self.total_actions
+            if np.all(np.isneginf(flat_q)):
+                veh_i = random.choice(idle_idxs) if idle_idxs else 0
+                idx = 0
+            else:
+                best_flat = int(np.argmax(flat_q))
+                veh_i = best_flat // self.total_actions
+                idx = best_flat % self.total_actions
 
+        # action dict 생성
         if idx < self.num_reject:
             act = {
                 'action_type': ActionType.REJECT,
@@ -644,7 +666,7 @@ def main():
 
 
     episode_logs = []
-    episodes = 500
+    episodes = 1
 
     agent = DQNAgent(state_size)
     weight_path = os.path.join(result_dir, "dqn_model_weights_final.weight.h5")
@@ -666,18 +688,20 @@ def main():
 
         while not done:
             st = env.get_state()
+            pprint(st)
             st = env.flatten_state(st)
+            env.update_current_requirement()
 
+            # print(env.time)
             while any(v.status == 'idle' for v in env.vehicles):
-                for v in env.vehicles:
-                    v.mask = False
                 batch_states = np.tile(st, (n_v, 1))
-
                 veh_i, act = agent.act(batch_states, env.vehicles)
 
+                pprint(act)
                 reward, next_state = env.step(veh_i, act)
                 total_reward += reward
 
+                pprint(next_state)
                 s = np.concatenate([batch_states[veh_i]])
                 s_next = env.flatten_state(next_state)
                 agent.remember(s.reshape(1, -1), [act], reward, s_next.reshape(1, -1), done)
