@@ -19,8 +19,8 @@ OD_MATRIX_PATH = os.path.join(DATA_PATH, 'od_matrix.csv')
 DQN_WEIGHT_PATH = os.path.join(RESULT_PATH, "dqn_model_weights_final.weight.h5")
 
 NUM_VEHICLES = 10
+NUM_REQUEST = 20
 VEH_CAPACITY = 5
-REQUEST_QUEUE_SIZE = 20
 MAX_WAIT_TIME = 10
 
 
@@ -61,8 +61,13 @@ def main():
 
     print("Data Load & Network Setup Complete")
 
-    state_size = NUM_VEHICLES * 4 + 20 * 3
-    agent = DQNAgent(state_size)
+    agent = DQNAgent(
+        num_vehicles=NUM_VEHICLES,
+        num_requests=NUM_REQUEST,
+        vehicle_input_dim=53,
+        request_input_dim=52,
+        hidden_dim=128,
+    )
     agent.load_model(DQN_WEIGHT_PATH)
 
     episode_logs = []
@@ -75,7 +80,7 @@ def main():
             vehicle_positions=vehicle_positions,
             veh_capacity=VEH_CAPACITY,
             num_vehicles=NUM_VEHICLES,
-            request_queue_size=REQUEST_QUEUE_SIZE,
+            num_requests=NUM_REQUEST,
             max_wait_time=MAX_WAIT_TIME
         )
 
@@ -90,6 +95,13 @@ def main():
             pprint(env.state)
 
             env.update_np_states()
+            curr_v = np.expand_dims(env.vehicle_np_states, axis=0)
+            curr_r = np.expand_dims(env.request_np_states, axis=0)
+            model_input = [curr_v, curr_r]
+            output = agent.model.predict(model_input)
+            print(output)
+            print(type(output))
+            print(output.shape)
             return
 
             # st = env.get_state()

@@ -8,13 +8,13 @@ from app.vehicle_status import VehicleStatus
 
 
 class RideSharingEnvironment:
-    def __init__(self, network, request_list, vehicle_positions, veh_capacity, num_vehicles, request_queue_size, max_wait_time):
+    def __init__(self, network, request_list, vehicle_positions, veh_capacity, num_vehicles, num_requests, max_wait_time):
         self.network = network
         self.all_request_list = request_list
         self.todo_request_list = request_list.copy()
         self.veh_capacity = veh_capacity
         self.num_vehicles = num_vehicles
-        self.request_queue_size = request_queue_size
+        self.num_requests = num_requests
         self.max_wait_time = max_wait_time
 
         self.curr_time = 0
@@ -57,7 +57,7 @@ class RideSharingEnvironment:
 
     def initialize_requests(self):
         self.request_states.clear()
-        for _ in range(self.request_queue_size):
+        for _ in range(self.num_requests):
             # 상태, from노드, to노드, 대기시간, 예상소요시간, 승객수
             r_state = [0, 0, 0, 0, 0, 0]
             self.request_states.append(r_state)
@@ -75,66 +75,72 @@ class RideSharingEnvironment:
     def update_np_states(self):
         all_list = []
         for vs in self.vehicle_states:
-            # print(vs)
             vec_status = [0] * VehicleStatus.NUM_CLASSES
             val = int(vs[0])
             if 1 <= val <= VehicleStatus.NUM_CLASSES:
                 vec_status[val - 1] = 1
-            # print(vec_status)
-
             vec_from = [0] * self.network.num_nodes
             val = int(vs[1])
             if 1 <= val <= self.network.num_nodes:
                 vec_from[val - 1] = 1
-            # print(vec_from)
-
             vec_to = [0] * self.network.num_nodes
             val = int(vs[2])
             if 1 <= val <= self.network.num_nodes:
                 vec_to[val - 1] = 1
-            # print(vec_to)
-
             vec_capa = [vs[3] / self.veh_capacity]
-            # print(vec_capa)
-
             vec_all = vec_status + vec_from + vec_to + vec_capa
             all_list.append(vec_all)
-        self.vehicle_np_states = np.array(all_list)
-        # print(self.vehicle_np_states.shape)
+        self.vehicle_np_states = np.array(all_list, dtype=np.float32)
+        # print(vec_status)
+        # print(vec_from)
+        # print(vec_to)
+        # print(vec_capa)
         # print(self.vehicle_np_states)
+        # print(self.vehicle_np_states.shape)
+        # print(self.vehicle_np_states.dtype)
 
         all_list = []
         for rs in self.request_states:
-            # print(rs)
             vec_status = [rs[0]]
-            # print(vec_status)
-
             vec_from = [0] * self.network.num_nodes
             val = int(rs[1])
             if 1 <= val <= self.network.num_nodes:
                 vec_from[val - 1] = 1
-            # print(vec_from)
-
             vec_to = [0] * self.network.num_nodes
             val = int(rs[2])
             if 1 <= val <= self.network.num_nodes:
                 vec_to[val - 1] = 1
-            # print(vec_to)
-
             vec_wait = [rs[3] / self.max_wait_time]
-            # print(vec_wait)
-
             vec_travel = [rs[4] / self.network.max_duration]
-            # print(vec_travel)
-
             vec_passengers = [rs[5] / self.veh_capacity]
-            # print(vec_passengers)
-
             vec_all = vec_status + vec_from + vec_to + vec_wait + vec_travel + vec_passengers
             all_list.append(vec_all)
-        self.request_np_states = np.array(all_list)
+        self.request_np_states = np.array(all_list, dtype=np.float32)
+        # print(vec_status)
+        # print(vec_from)
+        # print(vec_to)
+        # print(vec_wait)
+        # print(vec_travel)
+        # print(vec_passengers)
         # print(self.request_np_states)
         # print(self.request_np_states.shape)
+        # print(self.request_np_states.dtype)
+
+    def get_action_mask(self):
+        """
+        현재의 아래 state를 기준으로 q-value mask를 계산
+        - self.request_states
+        - self.vehicle_states
+
+        Masking Rule
+        - dummy request
+        - non-idle vehicle
+        - impossible request
+            - 최대 대기 시간 = 10분 내에 도달 못감
+            - 좌석 부족
+
+        """
+        return
 
 
     def get_state(self):

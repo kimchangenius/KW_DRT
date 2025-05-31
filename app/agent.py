@@ -11,8 +11,17 @@ from tensorflow.python.distribute.combinations import tf_function
 
 
 class DQNAgent:
-    def __init__(self, state_size, max_episodes=500):
-        self.state_size = state_size
+    def __init__(self, num_vehicles, num_requests, vehicle_input_dim, request_input_dim, hidden_dim,
+                 max_episodes=500):
+
+        self.num_vehicles = num_vehicles
+        self.num_requests = num_requests
+        self.vehicle_input_dim = vehicle_input_dim
+        self.request_input_dim = request_input_dim
+        self.hidden_dim = hidden_dim
+
+        self.model = self.build_drt_dqn_pairwise_model()
+        self.target_model = self.build_drt_dqn_pairwise_model()
 
         self.num_reject = 1
         self.num_matching = 20
@@ -35,12 +44,10 @@ class DQNAgent:
 
         self.memory = deque(maxlen=20000)
 
-        self.model = self.build_model()
-        self.target_model = self.build_model()
-        self.update_target_model()
-        self.target_update_counter = 0
-        self.train_counter = 0
-        self.target_update_freq = 1000
+        # self.update_target_model()
+        #  self.target_update_counter = 0
+        # self.train_counter = 0
+        # self.target_update_freq = 1000
 
     def update_target_model(self):
         self.target_model.set_weights(self.model.get_weights())
@@ -57,58 +64,33 @@ class DQNAgent:
         else:
             print(f"No model weights loaded at{file_path}")
 
-    def build_drt_dqn_model(self, vehicle_input_dim=53, request_input_dim=52,
-                            num_vehicles=10, num_requests=20, hidden_dim=128):
-        vehicle_input = Input(shape=(num_vehicles, vehicle_input_dim), name="vehicle_input")
-        request_input = Input(shape=(num_requests, request_input_dim), name="request_input")
+    def build_drt_dqn_pairwise_model(self):
+        vehicle_input = Input(shape=(self.num_vehicles, self.vehicle_input_dim), name="vehicle_input")  # (B, V, Dv)
+        request_input = Input(shape=(self.num_requests, self.request_input_dim), name="request_input")  # (B, R, Dr)
 
-        v_embed = TimeDistributed(Dense(hidden_dim, activation='relu'))(vehicle_input)
-        r_embed = TimeDistributed(Dense(hidden_dim, activation='relu'))(request_input)
+        v_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(vehicle_input)  # (B, V, H)
+        r_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(request_input)  # (B, R, H)
 
-        # Request summary (mean)
-        r_summary = Lambda(lambda x: tf.reduce_mean(x, axis=1, keepdims=True))(r_embed)
-        r_summary = RepeatVector(num_vehicles)(Lambda(lambda x: tf.squeeze(x, axis=1))(r_summary))
-        r_summary = Reshape((num_vehicles, hidden_dim))(r_summary)
+        v_expand = tf.expand_dims(v_embed, axis=2)  # (B, V, 1, H)
+        r_expand = tf.expand_dims(r_embed, axis=1)  # (B, 1, R, H)
 
-        # Combine each vehicle with global request context
-        v_context = Concatenate(axis=-1)([v_embed, r_summary])  # shape: (10, 2 * hidden_dim)
+        v_tiled = tf.tile(v_expand, [1, 1, self.num_requests, 1])  # (B, V, R, H)
+        r_tiled = tf.tile(r_expand, [1, self.num_vehicles, 1, 1])  # (B, V, R, H)
 
-        # Per-vehicle Q-value head (for 11 actions per vehicle)
-        q_outputs = []
-        for i in range(num_vehicles):
-            vi = Lambda(lambda x: x[:, i])(v_context)  # (batch, 2 * hidden_dim)
-            q_i = Dense(hidden_dim, activation='relu')(vi)
-            q_i = Dense(num_requests + 1)(q_i)  # 10 match + 1 reject
-            q_outputs.append(q_i)
+        # Broadcast concat to shape (B, V, R, 2H)
+        pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled])  # (B, V, R, 2H)
 
-        # Stack into (batch, 10, 21)
-        q_matrix = Lambda(lambda x: tf.stack(x, axis=1))(q_outputs)
+        q_match = TimeDistributed(TimeDistributed(Dense(self.hidden_dim, activation='relu')))(pair_embed)  # (B, V, R, H)
+        q_match = TimeDistributed(TimeDistributed(Dense(1)))(q_match)  # (B, V, R, 1)
+        q_match = Lambda(lambda x: tf.squeeze(x, axis=-1))(q_match)  # (B, V, R)
 
-        return Model(inputs=[vehicle_input, request_input], outputs=q_matrix)
+        q_reject = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(v_embed)  # (B, V, H)
+        q_reject = TimeDistributed(Dense(1))(q_reject)  # (B, V, 1)
 
-    def build_model(self):
-        state = Input(shape=(self.state_size,), name='state')
-        x = Dense(128, activation='relu')(state)
-        x = Dense(128, activation='relu')(x)
+        # Concatenate along request dim → total 21 actions
+        q_total = Concatenate(axis=-1)([q_match, q_reject])  # (B, V, R+1)
 
-        q_reject = Dense(self.num_reject, activation='linear', name='q_reject')(x)
-        q_matching = Dense(self.num_matching, activation='linear', name='q_matching')(x)
-        q_rebalance = Dense(self.num_rebalancing, activation='linear', name='q_rebalance')(x)
-
-        q_all = Concatenate(name='q_all')(
-            [q_reject, q_matching, q_rebalance]
-        )
-
-        model = Model(inputs=state, outputs=q_all)
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=5e-5,
-            clipnorm=0.5
-        )
-        model.compile(
-            optimizer=optimizer,
-            loss='huber'
-        )
-        return model
+        return Model(inputs=[vehicle_input, request_input], outputs=q_total)
 
     @tf_function
     def predict_q_all(self, states: tf.Tensor) -> tf.Tensor:
