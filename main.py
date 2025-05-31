@@ -1,72 +1,103 @@
 import os
+import csv
 import numpy as np
 import pandas as pd
 
 from pprint import pprint
-from app.network import SiouxFallsNetwork
 from app.env import RideSharingEnvironment
 from app.agent import DQNAgent
+from app.request import Request
+from app.network import DRTNetwork
+
+CURR_PATH = os.getcwd()
+DATA_PATH = os.path.join(CURR_PATH, 'data')
+RESULT_PATH = os.path.join(CURR_PATH, 'result')
+EPISODES_PATH = os.path.join(RESULT_PATH, 'episodes')
+PASSENGER_PATH = os.path.join(DATA_PATH, 'passengers.csv')
+VEH_POS_PATH = os.path.join(DATA_PATH, 'vehicle_positions.csv')
+OD_MATRIX_PATH = os.path.join(DATA_PATH, 'od_matrix.csv')
+DQN_WEIGHT_PATH = os.path.join(RESULT_PATH, "dqn_model_weights_final.weight.h5")
+
+NUM_VEHICLES = 10
+VEH_CAPACITY = 5
+REQUEST_QUEUE_SIZE = 20
+MAX_WAIT_TIME = 10
+
+
+def load_requests(path):
+    requests = []
+    with open(path, newline='', encoding="utf-8-sig") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            req = Request(
+                user_id=int(row["User_ID"]),
+                from_node_id=int(row["Start_node"]),
+                to_node_id=int(row["End_node"]),
+                request_time=int(row["Request_time"])
+            )
+            requests.append(req)
+    return requests
+
+
+def load_od_matrix(path):
+    df = pd.read_csv(path, index_col=0)
+    dist = {
+        int(o): {int(d): df.loc[o, d] for d in df.columns}
+        for o in df.index
+    }
+    return dist
 
 
 def main():
-    # data load & save
-    current_dir = os.getcwd()
-    data_dir = os.path.join(current_dir, 'data')
-    result_dir = os.path.join(current_dir, 'result')
-    episode_dir = os.path.join(result_dir, 'episodes')
-    passenger_data = os.path.join(data_dir, 'passengers.csv')
-    vehicle_positions = os.path.join(data_dir, 'vehicle_positions.csv')
-    net_data = os.path.join(data_dir, 'SiouxFalls_net.tntp')
-    flow_data = os.path.join(data_dir, 'SiouxFalls_flow.tntp')
-    node_coord_data = os.path.join(data_dir, 'SiouxFalls_node.tntp')
-    node_xy_data = os.path.join(data_dir, 'SiouxFalls_node_xy.tntp')
+    network = DRTNetwork()
+    network.set_od_matrix(OD_MATRIX_PATH)
 
-    network = SiouxFallsNetwork(net_data, flow_data, node_coord_data, node_xy_data) # create network
+    request_list = load_requests(PASSENGER_PATH)
+    request_list.sort(key=lambda r: r.request_time)
+    for r in request_list:
+        r.travel_time = network.get_duration(r.from_node_id, r.to_node_id)
 
-    travel_time_output = os.path.join(data_dir, 'travel_time.csv')
-    network.save_travel_time(travel_time_output)
+    vehicle_positions = pd.read_csv(VEH_POS_PATH)['initial_position'].tolist()
 
-    od_matrix_output = os.path.join(data_dir, 'od_matrix.csv')
-    network.generate_od_matrix(od_matrix_output)
+    print("Data Load & Network Setup Complete")
 
-    print("Simulation setup complete")
-
-    vehicle_positions = pd.read_csv(vehicle_positions)['initial_position'].tolist()
-    passenger_data = pd.read_csv(passenger_data)
-
-    state_size = len(vehicle_positions) * 5 + 20 * 3
-
+    state_size = NUM_VEHICLES * 4 + 20 * 3
+    agent = DQNAgent(state_size)
+    agent.load_model(DQN_WEIGHT_PATH)
 
     episode_logs = []
     episodes = 1
-
-    agent = DQNAgent(state_size)
-    weight_path = os.path.join(result_dir, "dqn_model_weights_final.weight.h5")
-    agent.load_model(weight_path)
-
     for ep in range(episodes):
         step_logs = []
         env = RideSharingEnvironment(
             network=network,
-            capacity=5,
-            passenger_data=passenger_data,
-            vehicle_positions=vehicle_positions
+            request_list=request_list,
+            vehicle_positions=vehicle_positions,
+            veh_capacity=VEH_CAPACITY,
+            num_vehicles=NUM_VEHICLES,
+            request_queue_size=REQUEST_QUEUE_SIZE,
+            max_wait_time=MAX_WAIT_TIME
         )
-        n_v = len(env.vehicles)
+
         total_reward = 0.0
         total_loss = 0.0
         prev_dropped = 0
         done = False
 
         while not done:
-            st = env.get_state()
-            pprint(st)
-            st = env.flatten_state(st)
-            env.update_current_requirement()
+            print('Curr Time : {}'.format(env.curr_time))
+            env.enqueue_requests()
+            pprint(env.state)
 
+            env.update_np_states()
+            return
+
+            # st = env.get_state()
+            # st = env.flatten_state(st)
+            # env.update_current_requirement()
             # print(env.time)
             while any(v.status == 'idle' for v in env.vehicles):
-                batch_states = np.tile(st, (n_v, 1))
+                batch_states = np.tile(st, (NUM_VEHICLES, 1))
                 veh_i, act = agent.act(batch_states, env.vehicles)
 
                 pprint(act)
@@ -84,12 +115,12 @@ def main():
 
                 st = s_next
 
-            env.time += 1
+            env.curr_time += 1
 
             for v in env.vehicles:
                 env.status_map.get(v.status, 0)
 
-            done = (env.time >= 60)
+            done = (env.curr_time >= 60)
             if done:
                 break
 
@@ -138,13 +169,13 @@ def main():
 
         print(f"Episode: {ep + 1}  Total Reward: {total_reward:.2f}  Total Loss: {total_loss:.4f}")
         step_df = pd.DataFrame(step_logs)
-        step_df.to_csv(os.path.join(episode_dir, f"{ep + 1} episode result.csv"), index=False)
+        step_df.to_csv(os.path.join(EPISODES_PATH, f"{ep + 1} episode result.csv"), index=False)
         if ep == episodes - 1:
-            final_model_path = os.path.join(result_dir, f"dqn_model_weights_final.weight.h5")
+            final_model_path = os.path.join(RESULT_PATH, f"dqn_model_weights_final.weight.h5")
             agent.save_model(final_model_path)
 
     df = pd.DataFrame(episode_logs)
-    df.to_csv(os.path.join(result_dir, "results.csv"), index=False)
+    df.to_csv(os.path.join(RESULT_PATH, "results.csv"), index=False)
     print("DQN training completed.")
 
 

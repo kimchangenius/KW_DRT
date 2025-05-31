@@ -1,29 +1,40 @@
-import random
 import numpy as np
 
+from pprint import pprint
 from app.passenger import Passenger
 from app.vehicle import Vehicle
 from app.action_type import ActionType
+from app.vehicle_status import VehicleStatus
+
 
 class RideSharingEnvironment:
-    def __init__(self, network, capacity, passenger_data, vehicle_positions):
+    def __init__(self, network, request_list, vehicle_positions, veh_capacity, num_vehicles, request_queue_size, max_wait_time):
         self.network = network
-        self.vehicles = self.initialize_vehicles(capacity, vehicle_positions)
-        # self.passengers = self.initialize_passengers(passenger_data)
+        self.all_request_list = request_list
+        self.todo_request_list = request_list.copy()
+        self.veh_capacity = veh_capacity
+        self.num_vehicles = num_vehicles
+        self.request_queue_size = request_queue_size
+        self.max_wait_time = max_wait_time
+
+        self.curr_time = 0
+        self.vehicles = []
+        self.request_states = []
+        self.vehicle_states = []
+        self.state = {
+            'vehicles': self.vehicle_states,
+            'requests': self.request_states
+        }
+        self.request_np_states = []
+        self.vehicle_np_states = []
+
+        self.initialize_vehicles(vehicle_positions)
+        self.initialize_requests()
+
         self.passengers = []
-        self.passengers_data = passenger_data
-        # 기존 환경 변수
-        self.time = 0
-        self.canceled_passengers = 0
-        self.rebalancing_count = 0
-        self.old_rebalance = 0
-        self.total_passenger_id = 0
-        self.matched_passengers = 0
         self.dropped_passengers = 0
         self.last_dropped = []
-        self.high_demand_nodes = []
-        self.max_request_time = self.passengers_data['Request_time'].max()
-        self.waiting_passenger_count = np.zeros(len(self.network.graph.nodes))
+        self.max_request_time = max(self.all_request_list, key=lambda r: r.request_time).request_time
 
         self.matched_ids = set()
         self.canceled_ids = set()
@@ -31,42 +42,108 @@ class RideSharingEnvironment:
         self.base_fare = 1
         self.VOT = 1.0
 
-        self.status_map = {'idle': 0, 'reject': 1, 'pickup': 2, 'dropoff': 3, 'rebalance': 4}
+        self.status_map = {'idle': 0, 'reject': 1, 'pickup': 2, 'dropoff': 3}
 
-    def initialize_vehicles(self, capacity, vehicle_position):
-        vehicle = []
+    def initialize_vehicles(self, vehicle_position):
         for idx, pos in enumerate(vehicle_position):
-            vehicle.append(Vehicle(idx, capacity, pos, self.network, self))
-        return vehicle
+            veh = Vehicle(idx, self.veh_capacity, pos, self)
+            self.vehicles.append(veh)
 
-    def get_high_demand_nodes(self):
-        recent_requests = [p.start for p in self.passengers if self.time - p.request_time <= 10]
-        demand_count = {node: recent_requests.count(node) for node in self.network.graph.nodes}
-        historical_data_factor = {node: random.uniform(1.0, 1.5) for node in self.network.graph.nodes}
-        for node in demand_count:
-            demand_count[node] *= historical_data_factor[node]
-        if sum(demand_count.values()) == 0:
-            return random.sample(list(self.network.graph.nodes), 3)
-        return sorted(demand_count, key=demand_count.get, reverse=True)[:3]
+        self.vehicle_states.clear()
+        for v in self.vehicles:
+            # 상태, 현재 노드, 목적지 노드, 남은 좌석 수
+            v_state = [v.status, v.curr_node, v.next_node, v.get_remaining_seats()]
+            self.vehicle_states.append(v_state)
 
-    def generate_passengers_for_current_time(self):
-        if self.time <= self.max_request_time:
-            new = self.passengers_data[self.passengers_data['Request_time'] == self.time]
-            existing_ids = {p.id for p in self.passengers}
-            for _, row in new.iterrows():
-                if row['User_ID'] not in existing_ids:
-                    p = Passenger(row['User_ID'], row['Start_node'], row['End_node'], row['Request_time'], self.network)
-                    self.passengers.append(p)
-                    self.waiting_passenger_count[p.start] += 1
+    def initialize_requests(self):
+        self.request_states.clear()
+        for _ in range(self.request_queue_size):
+            # 상태, from노드, to노드, 대기시간, 예상소요시간, 승객수
+            r_state = [0, 0, 0, 0, 0, 0]
+            self.request_states.append(r_state)
+
+    def enqueue_requests(self):
+        while self.todo_request_list and self.todo_request_list[0].request_time <= self.curr_time:
+            r = self.todo_request_list.pop(0)
+            # 상태, from노드, to노드, 대기시간, 예상소요시간, 승객수
+            r_state = [1, r.from_node_id, r.to_node_id, 0, r.travel_time, 1]
+            for i, row in enumerate(self.request_states):
+                if row[0] == 0:
+                    self.request_states[i] = r_state
+                    break
+
+    def update_np_states(self):
+        all_list = []
+        for vs in self.vehicle_states:
+            # print(vs)
+            vec_status = [0] * VehicleStatus.NUM_CLASSES
+            val = int(vs[0])
+            if 1 <= val <= VehicleStatus.NUM_CLASSES:
+                vec_status[val - 1] = 1
+            # print(vec_status)
+
+            vec_from = [0] * self.network.num_nodes
+            val = int(vs[1])
+            if 1 <= val <= self.network.num_nodes:
+                vec_from[val - 1] = 1
+            # print(vec_from)
+
+            vec_to = [0] * self.network.num_nodes
+            val = int(vs[2])
+            if 1 <= val <= self.network.num_nodes:
+                vec_to[val - 1] = 1
+            # print(vec_to)
+
+            vec_capa = [vs[3] / self.veh_capacity]
+            # print(vec_capa)
+
+            vec_all = vec_status + vec_from + vec_to + vec_capa
+            all_list.append(vec_all)
+        self.vehicle_np_states = np.array(all_list)
+        # print(self.vehicle_np_states.shape)
+        # print(self.vehicle_np_states)
+
+        all_list = []
+        for rs in self.request_states:
+            # print(rs)
+            vec_status = [rs[0]]
+            # print(vec_status)
+
+            vec_from = [0] * self.network.num_nodes
+            val = int(rs[1])
+            if 1 <= val <= self.network.num_nodes:
+                vec_from[val - 1] = 1
+            # print(vec_from)
+
+            vec_to = [0] * self.network.num_nodes
+            val = int(rs[2])
+            if 1 <= val <= self.network.num_nodes:
+                vec_to[val - 1] = 1
+            # print(vec_to)
+
+            vec_wait = [rs[3] / self.max_wait_time]
+            # print(vec_wait)
+
+            vec_travel = [rs[4] / self.network.max_duration]
+            # print(vec_travel)
+
+            vec_passengers = [rs[5] / self.veh_capacity]
+            # print(vec_passengers)
+
+            vec_all = vec_status + vec_from + vec_to + vec_wait + vec_travel + vec_passengers
+            all_list.append(vec_all)
+        self.request_np_states = np.array(all_list)
+        # print(self.request_np_states)
+        # print(self.request_np_states.shape)
+
 
     def get_state(self):
         """
         V_t
-        차량의 상태: vehicle.status
         현재 차량의 위치: vehicle.current_location
         차량이 이동해야하는 리스트: vehicle.current_path[0] == next_node
         남은 좌석수: vehicle.capacity - len(vehicle.passengers)
-        재배치 목표: vehicle.rebalance_target
+        차량의 상태: vehicle.status
 
         R_t
         요청 최대 20개 queue: 대기 중(request_time None)인 승객을 request_time 순으로 정렬한 후 상위 20개
@@ -75,13 +152,11 @@ class RideSharingEnvironment:
         # 차량 상태 V_t
         vehicle_features = []
         for v in self.vehicles:
-            next_node = v.current_path[0] if v.current_path else -1
             vehicle_features.append([
-                v.current_location,
-                next_node,
-                v.capacity - len(v.passengers),
-                self.status_map.get(v.status, 0),
-                v.rebalance_target or -1
+                v.curr_node,
+                v.next_node,
+                v.get_remaining_seats(),
+                v.status
             ])
         vehicle_array = np.array(vehicle_features, dtype=float)
 
@@ -120,7 +195,7 @@ class RideSharingEnvironment:
             if 0 <= p_idx < len(self.passengers):
                 p = self.passengers[p_idx]
                 if p.pickup_time is None:
-                    p.pickup_time = self.time
+                    p.pickup_time = self.curr_time
                     vehicle.add_passenger(p)
                     self.matched_ids.add(p.id)
                     step_matched += 1
@@ -146,28 +221,6 @@ class RideSharingEnvironment:
                     self.status_map.get(vehicle.status, 2)
                     vehicle.current_request = {'type': 'pickup', 'passenger_id': p.id}
 
-
-        elif action['action_type'] == ActionType.REBALANCING:
-            high_nodes = self.get_high_demand_nodes()
-            r = action['discrete_index']
-            target = high_nodes[r]
-            vehicle.rebalance_target = target
-
-            full_path = self.network.get_shortest_path(
-                vehicle.current_location, target
-            )
-            vehicle.current_path = full_path
-            if len(full_path) > 1:
-                vehicle.remaining_travel_time = self.network.get_travel_time(
-                    [full_path[0], full_path[1]]
-                )
-            else:
-                vehicle.remaining_travel_time = 0
-
-            self.status_map.get(vehicle.status, 4)
-            vehicle.current_request = {'type': 'rebalance', 'target': target}
-            self.rebalancing_count += 1
-
         dropped = vehicle.move_to_next_location()
         if dropped:
             self.status_map.get(vehicle.status, 3)
@@ -177,7 +230,7 @@ class RideSharingEnvironment:
         for p in list(self.passengers):
             if p.start == vehicle.current_location and p.pickup_time is None:
                 if vehicle.add_passenger(p):
-                    p.pickup_time = self.time
+                    p.pickup_time = self.curr_time
                     self.matched_ids.add(p.id)
                     step_matched += 1
                     self.passengers.remove(p)
@@ -193,7 +246,7 @@ class RideSharingEnvironment:
         dropoff_reward = step_drop * self.base_fare * 1.2 * dropoff_ratio
 
         for p in dropped:
-            if p.pickup_time is not None and p.dropoff_time == self.time:
+            if p.pickup_time is not None and p.dropoff_time == self.curr_time:
                 t_wait = max(0, p.pickup_time - p.request_time)
                 trav = p.dropoff_time - p.pickup_time
                 detour = max(0, trav - p.direct_route_time)
@@ -207,12 +260,22 @@ class RideSharingEnvironment:
         # reward = np.clip(reward, -5.0, 5.0)
         return reward
 
+    def generate_passengers_for_current_time(self):
+        if self.curr_time <= self.max_request_time:
+            new = self.all_request_list[self.all_request_list['Request_time'] == self.curr_time]
+            existing_ids = {p.id for p in self.passengers}
+            for _, row in new.iterrows():
+                if row['User_ID'] not in existing_ids:
+                    p = Passenger(row['User_ID'], row['Start_node'], row['End_node'], row['Request_time'], self.network)
+                    self.passengers.append(p)
+                    self.waiting_passenger_count[p.start] += 1
+
     def update_current_requirement(self):
-        if self.time <= self.max_request_time:
+        if self.curr_time <= self.max_request_time:
             self.generate_passengers_for_current_time()
         cancel_limit = 10
         for p in list(self.passengers):
-            if p.pickup_time is None and (self.time - p.request_time) > cancel_limit:
+            if p.pickup_time is None and (self.curr_time - p.request_time) > cancel_limit:
                 self.canceled_ids.add(p.id)
                 self.passengers.remove(p)
 

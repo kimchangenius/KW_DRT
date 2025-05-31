@@ -6,8 +6,9 @@ import tensorflow as tf
 from collections import deque
 from app.action_type import ActionType
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Input, Concatenate
+from tensorflow.keras.layers import Input, Dense, TimeDistributed, Lambda, Concatenate, RepeatVector, Reshape
 from tensorflow.python.distribute.combinations import tf_function
+
 
 class DQNAgent:
     def __init__(self, state_size, max_episodes=500):
@@ -55,6 +56,35 @@ class DQNAgent:
             print(f"Model weights loaded at {file_path}")
         else:
             print(f"No model weights loaded at{file_path}")
+
+    def build_drt_dqn_model(self, vehicle_input_dim=53, request_input_dim=52,
+                            num_vehicles=10, num_requests=20, hidden_dim=128):
+        vehicle_input = Input(shape=(num_vehicles, vehicle_input_dim), name="vehicle_input")
+        request_input = Input(shape=(num_requests, request_input_dim), name="request_input")
+
+        v_embed = TimeDistributed(Dense(hidden_dim, activation='relu'))(vehicle_input)
+        r_embed = TimeDistributed(Dense(hidden_dim, activation='relu'))(request_input)
+
+        # Request summary (mean)
+        r_summary = Lambda(lambda x: tf.reduce_mean(x, axis=1, keepdims=True))(r_embed)
+        r_summary = RepeatVector(num_vehicles)(Lambda(lambda x: tf.squeeze(x, axis=1))(r_summary))
+        r_summary = Reshape((num_vehicles, hidden_dim))(r_summary)
+
+        # Combine each vehicle with global request context
+        v_context = Concatenate(axis=-1)([v_embed, r_summary])  # shape: (10, 2 * hidden_dim)
+
+        # Per-vehicle Q-value head (for 11 actions per vehicle)
+        q_outputs = []
+        for i in range(num_vehicles):
+            vi = Lambda(lambda x: x[:, i])(v_context)  # (batch, 2 * hidden_dim)
+            q_i = Dense(hidden_dim, activation='relu')(vi)
+            q_i = Dense(num_requests + 1)(q_i)  # 10 match + 1 reject
+            q_outputs.append(q_i)
+
+        # Stack into (batch, 10, 21)
+        q_matrix = Lambda(lambda x: tf.stack(x, axis=1))(q_outputs)
+
+        return Model(inputs=[vehicle_input, request_input], outputs=q_matrix)
 
     def build_model(self):
         state = Input(shape=(self.state_size,), name='state')
