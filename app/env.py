@@ -1,35 +1,27 @@
 import numpy as np
+import app.config as cfg
 
 from pprint import pprint
 from app.passenger import Passenger
+from app.request_status import RequestStatus
 from app.vehicle import Vehicle
 from app.action_type import ActionType
-from app.vehicle_status import VehicleStatus
 
 
 class RideSharingEnvironment:
-    def __init__(self, network, request_list, vehicle_positions, veh_capacity, num_vehicles, num_requests, max_wait_time):
+    def __init__(self, network, request_list, vehicle_positions):
         self.network = network
         self.all_request_list = request_list
         self.todo_request_list = request_list.copy()
-        self.veh_capacity = veh_capacity
-        self.num_vehicles = num_vehicles
-        self.num_requests = num_requests
-        self.max_wait_time = max_wait_time
 
         self.curr_time = 0
         self.vehicles = []
-        self.request_states = []
-        self.vehicle_states = []
-        self.state = {
-            'vehicles': self.vehicle_states,
-            'requests': self.request_states
-        }
-        self.request_np_states = []
+        self.requests = []
         self.vehicle_np_states = []
+        self.request_np_states = []
+        self.relation_np_states = []
 
         self.initialize_vehicles(vehicle_positions)
-        self.initialize_requests()
 
         self.passengers = []
         self.dropped_passengers = 0
@@ -46,85 +38,70 @@ class RideSharingEnvironment:
 
     def initialize_vehicles(self, vehicle_position):
         for idx, pos in enumerate(vehicle_position):
-            veh = Vehicle(idx, self.veh_capacity, pos, self)
+            veh = Vehicle(idx, pos, self.network)
             self.vehicles.append(veh)
-
-        self.vehicle_states.clear()
-        for v in self.vehicles:
-            # 상태, 현재 노드, 목적지 노드, 남은 좌석 수
-            v_state = [v.status, v.curr_node, v.next_node, v.get_remaining_seats()]
-            self.vehicle_states.append(v_state)
-
-    def initialize_requests(self):
-        self.request_states.clear()
-        for _ in range(self.num_requests):
-            # 상태, from노드, to노드, 대기시간, 예상소요시간, 승객수
-            r_state = [0, 0, 0, 0, 0, 0]
-            self.request_states.append(r_state)
 
     def enqueue_requests(self):
         while self.todo_request_list and self.todo_request_list[0].request_time <= self.curr_time:
             r = self.todo_request_list.pop(0)
-            # 상태, from노드, to노드, 대기시간, 예상소요시간, 승객수
-            r_state = [1, r.from_node_id, r.to_node_id, 0, r.travel_time, 1]
-            for i, row in enumerate(self.request_states):
-                if row[0] == 0:
-                    self.request_states[i] = r_state
-                    break
+            r.waiting_time = self.curr_time - r.request_time
+            r.time_to_deadline = r.deadline - self.curr_time
+            self.requests.append(r)
 
     def update_np_states(self):
         all_list = []
-        for vs in self.vehicle_states:
-            vec_status = [0] * VehicleStatus.NUM_CLASSES
-            val = int(vs[0])
-            if 1 <= val <= VehicleStatus.NUM_CLASSES:
-                vec_status[val - 1] = 1
-            vec_from = [0] * self.network.num_nodes
-            val = int(vs[1])
-            if 1 <= val <= self.network.num_nodes:
-                vec_from[val - 1] = 1
-            vec_to = [0] * self.network.num_nodes
-            val = int(vs[2])
-            if 1 <= val <= self.network.num_nodes:
-                vec_to[val - 1] = 1
-            vec_capa = [vs[3] / self.veh_capacity]
-            vec_all = vec_status + vec_from + vec_to + vec_capa
-            all_list.append(vec_all)
+        for v in self.vehicles:
+            print(v)
+            all_list.append(v.get_state())
         self.vehicle_np_states = np.array(all_list, dtype=np.float32)
-        # print(vec_status)
-        # print(vec_from)
-        # print(vec_to)
-        # print(vec_capa)
         # print(self.vehicle_np_states)
         # print(self.vehicle_np_states.shape)
         # print(self.vehicle_np_states.dtype)
 
         all_list = []
-        for rs in self.request_states:
-            vec_status = [rs[0]]
-            vec_from = [0] * self.network.num_nodes
-            val = int(rs[1])
-            if 1 <= val <= self.network.num_nodes:
-                vec_from[val - 1] = 1
-            vec_to = [0] * self.network.num_nodes
-            val = int(rs[2])
-            if 1 <= val <= self.network.num_nodes:
-                vec_to[val - 1] = 1
-            vec_wait = [rs[3] / self.max_wait_time]
-            vec_travel = [rs[4] / self.network.max_duration]
-            vec_passengers = [rs[5] / self.veh_capacity]
-            vec_all = vec_status + vec_from + vec_to + vec_wait + vec_travel + vec_passengers
-            all_list.append(vec_all)
+        for r in self.requests:
+            print(r)
+            all_list.append(r.get_state())
+
+        missing = cfg.NUM_REQUEST - len(all_list)
+        if missing > 0:
+            zero_vec = [0.0] * cfg.REQUEST_INPUT_DIM
+            all_list.extend([zero_vec] * missing)
+
         self.request_np_states = np.array(all_list, dtype=np.float32)
-        # print(vec_status)
-        # print(vec_from)
-        # print(vec_to)
-        # print(vec_wait)
-        # print(vec_travel)
-        # print(vec_passengers)
         # print(self.request_np_states)
         # print(self.request_np_states.shape)
         # print(self.request_np_states.dtype)
+
+        all_list = []
+        for v in self.vehicles:
+            v_list = []
+            for r in self.requests:
+                need_drop_off = 0
+                if r in v.curr_requests:
+                    need_drop_off = 1
+
+                if r.status == RequestStatus.PENDING:
+                    dur = self.network.get_duration(v.curr_node, r.from_node_id)
+                elif r.status == RequestStatus.PICKEDUP and need_drop_off == 1:
+                    dur = self.network.get_duration(v.curr_node, r.to_node_id)
+                else:
+                    dur = 0
+                dur = dur / self.network.max_duration
+                vec = [need_drop_off, dur]
+                v_list.append(vec)
+
+            missing = cfg.NUM_REQUEST - len(v_list)
+            if missing > 0:
+                zero_vec = [0.0] * cfg.RELATION_INPUT_DIM
+                v_list.extend([zero_vec] * missing)
+
+            all_list.append(v_list)
+        self.relation_np_states = np.array(all_list, dtype=np.float32)
+        # print(self.relation_np_states)
+        # print(self.relation_np_states.shape)
+        # print(self.relation_np_states.dtype)
+
 
     def get_action_mask(self):
         """

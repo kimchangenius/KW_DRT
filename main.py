@@ -18,56 +18,38 @@ VEH_POS_PATH = os.path.join(DATA_PATH, 'vehicle_positions.csv')
 OD_MATRIX_PATH = os.path.join(DATA_PATH, 'od_matrix.csv')
 DQN_WEIGHT_PATH = os.path.join(RESULT_PATH, "dqn_model_weights_final.weight.h5")
 
-NUM_VEHICLES = 10
-NUM_REQUEST = 20
-VEH_CAPACITY = 5
-MAX_WAIT_TIME = 10
 
-
-def load_requests(path):
+def load_requests(path, network):
     requests = []
     with open(path, newline='', encoding="utf-8-sig") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
             req = Request(
-                user_id=int(row["User_ID"]),
+                request_id=int(row["User_ID"]),
                 from_node_id=int(row["Start_node"]),
                 to_node_id=int(row["End_node"]),
-                request_time=int(row["Request_time"])
+                request_time=int(row["Request_time"]),
+                network=network
             )
             requests.append(req)
     return requests
-
-
-def load_od_matrix(path):
-    df = pd.read_csv(path, index_col=0)
-    dist = {
-        int(o): {int(d): df.loc[o, d] for d in df.columns}
-        for o in df.index
-    }
-    return dist
 
 
 def main():
     network = DRTNetwork()
     network.set_od_matrix(OD_MATRIX_PATH)
 
-    request_list = load_requests(PASSENGER_PATH)
+    request_list = load_requests(PASSENGER_PATH, network)
     request_list.sort(key=lambda r: r.request_time)
     for r in request_list:
-        r.travel_time = network.get_duration(r.from_node_id, r.to_node_id)
+        tt = network.get_duration(r.from_node_id, r.to_node_id)
+        r.set_travel_time(tt)
 
     vehicle_positions = pd.read_csv(VEH_POS_PATH)['initial_position'].tolist()
 
     print("Data Load & Network Setup Complete")
 
-    agent = DQNAgent(
-        num_vehicles=NUM_VEHICLES,
-        num_requests=NUM_REQUEST,
-        vehicle_input_dim=53,
-        request_input_dim=52,
-        hidden_dim=128,
-    )
+    agent = DQNAgent(hidden_dim=128)
     agent.load_model(DQN_WEIGHT_PATH)
 
     episode_logs = []
@@ -77,11 +59,7 @@ def main():
         env = RideSharingEnvironment(
             network=network,
             request_list=request_list,
-            vehicle_positions=vehicle_positions,
-            veh_capacity=VEH_CAPACITY,
-            num_vehicles=NUM_VEHICLES,
-            num_requests=NUM_REQUEST,
-            max_wait_time=MAX_WAIT_TIME
+            vehicle_positions=vehicle_positions
         )
 
         total_reward = 0.0
@@ -91,13 +69,13 @@ def main():
 
         while not done:
             print('Curr Time : {}'.format(env.curr_time))
-            env.enqueue_requests()
-            pprint(env.state)
+            env.enqueue_requests()   # 시간이 갱신될 때마다 호출
 
             env.update_np_states()
-            curr_v = np.expand_dims(env.vehicle_np_states, axis=0)
-            curr_r = np.expand_dims(env.request_np_states, axis=0)
-            model_input = [curr_v, curr_r]
+            curr_veh = np.expand_dims(env.vehicle_np_states, axis=0)
+            curr_req = np.expand_dims(env.request_np_states, axis=0)
+            curr_rel = np.expand_dims(env.relation_np_states, axis=0)
+            model_input = [curr_veh, curr_req, curr_rel]
             output = agent.model.predict(model_input)
             print(output)
             print(type(output))

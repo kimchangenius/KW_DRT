@@ -2,6 +2,7 @@ import os
 import random
 import numpy as np
 import tensorflow as tf
+import app.config as cfg
 
 from collections import deque
 from app.action_type import ActionType
@@ -11,15 +12,8 @@ from tensorflow.python.distribute.combinations import tf_function
 
 
 class DQNAgent:
-    def __init__(self, num_vehicles, num_requests, vehicle_input_dim, request_input_dim, hidden_dim,
-                 max_episodes=500):
-
-        self.num_vehicles = num_vehicles
-        self.num_requests = num_requests
-        self.vehicle_input_dim = vehicle_input_dim
-        self.request_input_dim = request_input_dim
+    def __init__(self, hidden_dim, max_episodes=500):
         self.hidden_dim = hidden_dim
-
         self.model = self.build_drt_dqn_pairwise_model()
         self.target_model = self.build_drt_dqn_pairwise_model()
 
@@ -65,8 +59,9 @@ class DQNAgent:
             print(f"No model weights loaded at{file_path}")
 
     def build_drt_dqn_pairwise_model(self):
-        vehicle_input = Input(shape=(self.num_vehicles, self.vehicle_input_dim), name="vehicle_input")  # (B, V, Dv)
-        request_input = Input(shape=(self.num_requests, self.request_input_dim), name="request_input")  # (B, R, Dr)
+        vehicle_input = Input(shape=(cfg.NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")  # (B, V, Dv)
+        request_input = Input(shape=(cfg.NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")  # (B, R, Dr)
+        relation_input = Input(shape=(cfg.NUM_VEHICLES, cfg.NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input") # (B, V, R, Drel)
 
         v_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(vehicle_input)  # (B, V, H)
         r_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(request_input)  # (B, R, H)
@@ -74,23 +69,27 @@ class DQNAgent:
         v_expand = tf.expand_dims(v_embed, axis=2)  # (B, V, 1, H)
         r_expand = tf.expand_dims(r_embed, axis=1)  # (B, 1, R, H)
 
-        v_tiled = tf.tile(v_expand, [1, 1, self.num_requests, 1])  # (B, V, R, H)
-        r_tiled = tf.tile(r_expand, [1, self.num_vehicles, 1, 1])  # (B, V, R, H)
+        v_tiled = tf.tile(v_expand, [1, 1, cfg.NUM_REQUEST, 1])  # (B, V, R, H)
+        r_tiled = tf.tile(r_expand, [1, cfg.NUM_VEHICLES, 1, 1])  # (B, V, R, H)
 
-        # Broadcast concat to shape (B, V, R, 2H)
-        pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled])  # (B, V, R, 2H)
+        # Broadcast concat to shape (B, V, R, 2H + Drel)
+        pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled, relation_input])  # (B, V, R, 2H + Drel)
 
         q_match = TimeDistributed(TimeDistributed(Dense(self.hidden_dim, activation='relu')))(pair_embed)  # (B, V, R, H)
         q_match = TimeDistributed(TimeDistributed(Dense(1)))(q_match)  # (B, V, R, 1)
         q_match = Lambda(lambda x: tf.squeeze(x, axis=-1))(q_match)  # (B, V, R)
 
-        q_reject = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(v_embed)  # (B, V, H)
+        r_summary = tf.reduce_mean(r_embed, axis=1)  # (B, H)
+        r_summary = RepeatVector(cfg.NUM_VEHICLES)(r_summary)  # (B, V, H)
+        reject_context = Concatenate(axis=-1)([v_embed, r_summary])  # (B, V, 2H)
+
+        q_reject = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(reject_context)
         q_reject = TimeDistributed(Dense(1))(q_reject)  # (B, V, 1)
 
         # Concatenate along request dim → total 21 actions
         q_total = Concatenate(axis=-1)([q_match, q_reject])  # (B, V, R+1)
 
-        return Model(inputs=[vehicle_input, request_input], outputs=q_total)
+        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_total)
 
     @tf_function
     def predict_q_all(self, states: tf.Tensor) -> tf.Tensor:
