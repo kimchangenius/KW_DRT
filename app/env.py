@@ -1,83 +1,89 @@
+import copy
 import numpy as np
 import app.config as cfg
 
 from pprint import pprint
-from app.passenger import Passenger
 from app.request_status import RequestStatus
 from app.vehicle import Vehicle
-from app.action_type import ActionType
 from app.vehicle_status import VehicleStatus
 
 
 class RideSharingEnvironment:
-    def __init__(self, network, request_list, vehicle_positions):
+    def __init__(self, network, original_request_list, vehicle_init_pos):
         self.network = network
-        self.all_request_list = request_list
-        self.todo_request_list = request_list.copy()
+        self.original_request_list = original_request_list
+        self.vehicle_init_pos = vehicle_init_pos
 
+        self.curr_time = None
+        self.todo_request_list = None   # request들 중 미래에 들어올 것들 (정렬되어 있음)
+
+        self.vehicle_list = None
+        self.request_list = None        # 현재 request 슬롯에 들어갈 것들 (최대 개수가 정해져있음)
+
+        self.vehicle_state = None
+        self.request_state = None
+        self.relation_state = None
+        self.state = None
+
+    def reset(self):
         self.curr_time = 0
-        self.vehicles = []
-        self.requests = []
-        self.vehicle_np_states = []
-        self.request_np_states = []
-        self.relation_np_states = []
+        self.todo_request_list = copy.deepcopy(self.original_request_list)
 
-        self.initialize_vehicles(vehicle_positions)
+        self.vehicle_list = []
+        self.request_list = []
 
-        self.passengers = []
-        self.dropped_passengers = 0
-        self.last_dropped = []
-        self.max_request_time = max(self.all_request_list, key=lambda r: r.request_time).request_time
+        self.initialize_vehicles()
+        self.handle_time_update()
+        self.sync_state()
 
-        self.matched_ids = set()
-        self.canceled_ids = set()
+        return self.state
 
-        self.base_fare = 1
-        self.VOT = 1.0
-
-        self.status_map = {'idle': 0, 'reject': 1, 'pickup': 2, 'dropoff': 3}
-
-    def initialize_vehicles(self, vehicle_position):
-        for idx, pos in enumerate(vehicle_position):
+    def initialize_vehicles(self):
+        for idx, pos in enumerate(self.vehicle_init_pos):
             veh = Vehicle(idx, pos, self.network)
-            self.vehicles.append(veh)
+            self.vehicle_list.append(veh)
 
-    def enqueue_requests(self):
+    # 시간이 업데이트 될 때 필요한 모든 것들을 업데이트 함
+    def handle_time_update(self):
         while self.todo_request_list and self.todo_request_list[0].request_time <= self.curr_time:
             r = self.todo_request_list.pop(0)
             r.waiting_time = self.curr_time - r.request_time
             r.time_to_deadline = r.deadline - self.curr_time
-            self.requests.append(r)
+            self.request_list.append(r)
 
-    def update_np_states(self):
+        for idx, r in enumerate(self.request_list):
+            r.slot_idx = idx
+
+    # 기존에 가진 자료구조들을 토대로 state 형태로 만들어주기만 하는 역할
+    # 이 안에서 상태가 바뀌거나 업데이트가 되어서는 안됨
+    def sync_state(self):
         all_list = []
-        for v in self.vehicles:
-            print(v)
-            all_list.append(v.get_state())
-        self.vehicle_np_states = np.array(all_list, dtype=np.float32)
-        # print(self.vehicle_np_states)
-        # print(self.vehicle_np_states.shape)
-        # print(self.vehicle_np_states.dtype)
+        for v in self.vehicle_list:
+            all_list.append(v.get_vector())
+        self.vehicle_state = np.array(all_list, dtype=np.float32)
+        # print(self.vehicle_state)
+        # print(self.vehicle_state.shape)
+        # print(self.vehicle_state.dtype)
 
         all_list = []
-        for r in self.requests:
+        for r in self.request_list:
             print(r)
-            all_list.append(r.get_state())
+            all_list.append(r.get_vector())
 
         missing = cfg.NUM_REQUEST - len(all_list)
         if missing > 0:
             zero_vec = [0.0] * cfg.REQUEST_INPUT_DIM
             all_list.extend([zero_vec] * missing)
 
-        self.request_np_states = np.array(all_list, dtype=np.float32)
-        # print(self.request_np_states)
-        # print(self.request_np_states.shape)
-        # print(self.request_np_states.dtype)
+        self.request_state = np.array(all_list, dtype=np.float32)
+        # print(self.request_state)
+        # print(self.request_state.shape)
+        # print(self.request_state.dtype)
 
         all_list = []
-        for v in self.vehicles:
+        for v in self.vehicle_list:
             v_list = []
-            for r in self.requests:
+            for r in self.request_list:
                 need_drop_off = 0
                 if r in v.curr_requests:
                     need_drop_off = 1
@@ -98,10 +104,16 @@ class RideSharingEnvironment:
                 v_list.extend([zero_vec] * missing)
 
             all_list.append(v_list)
-        self.relation_np_states = np.array(all_list, dtype=np.float32)
-        # print(self.relation_np_states)
-        # print(self.relation_np_states.shape)
-        # print(self.relation_np_states.dtype)
+        self.relation_state = np.array(all_list, dtype=np.float32)
+        # print(self.relation_state)
+        # print(self.relation_state.shape)
+        # print(self.relation_state.dtype)
+
+        self.state = [
+            np.expand_dims(self.vehicle_state, axis=0),
+            np.expand_dims(self.request_state, axis=0),
+            np.expand_dims(self.relation_state, axis=0)
+        ]
 
     def get_action_mask(self):
         """
@@ -111,10 +123,9 @@ class RideSharingEnvironment:
             - Non-Pending vehicle
             - Seat Not available
         - Dummy request
-
         """
         all_list = []
-        for v in self.vehicles:
+        for v in self.vehicle_list:
             v_row = []
 
             # 현재 차량이 Non-idle
@@ -123,7 +134,7 @@ class RideSharingEnvironment:
                 continue
 
             # 현재 차량이 Idle, 현재 request가 Dummy가 아닐 경우
-            for r in self.requests:
+            for r in self.request_list:
                 # 현재 request가 이미 해당 차량에 assigned된 경우, 즉 drop off 대상
                 if r.status == RequestStatus.PICKEDUP:
                     if r.assigned_v_id == v.id:
@@ -139,7 +150,7 @@ class RideSharingEnvironment:
                     v_row.append(0)
 
             # 현재 request가 Dummy 일 경우
-            missing = cfg.NUM_REQUEST - len(self.requests)
+            missing = cfg.NUM_REQUEST - len(self.request_list)
             if missing > 0:
                 v_row.extend([0] * missing)
 
@@ -149,152 +160,12 @@ class RideSharingEnvironment:
             all_list.append(v_row)
         return np.array(all_list, dtype=np.float32)
 
-
-    def get_state(self):
-        """
-        V_t
-        현재 차량의 위치: vehicle.current_location
-        차량이 이동해야하는 리스트: vehicle.current_path[0] == next_node
-        남은 좌석수: vehicle.capacity - len(vehicle.passengers)
-        차량의 상태: vehicle.status
-
-        R_t
-        요청 최대 20개 queue: 대기 중(request_time None)인 승객을 request_time 순으로 정렬한 후 상위 20개
-        부족 시 [0,0,-1]로 패딩
-        """
-        # 차량 상태 V_t
-        vehicle_features = []
-        for v in self.vehicles:
-            vehicle_features.append([
-                v.curr_node,
-                v.next_node,
-                v.get_remaining_seats(),
-                v.status
-            ])
-        vehicle_array = np.array(vehicle_features, dtype=float)
-
-        # 요청 상태 R_t
-        waiting = [p for p in self.passengers if p.pickup_time is None]
-        waiting.sort(key=lambda p: p.request_time, reverse=True)
-        top20 = waiting[:20]
-        req_feats = [[p.start, p.end, p.request_time] for p in top20]
-        while len(req_feats) < 20:
-            req_feats.append([0, 0, -1])
-        requests_array = np.array(req_feats, dtype=float)
-
-        return {'vehicles': vehicle_array, 'requests': requests_array}
-
-    def flatten_state(self, state):
-        vehicles_flat = state['vehicles'].flatten()
-        requests_flat = state['requests'].flatten()
-
-        return np.concatenate([vehicles_flat, requests_flat])
-
-    def single_action(self, v_idx, action):
-        """
-        차량 v_idx에 대해 단일 action 적용, 반환 보상
-        """
-        vehicle = self.vehicles[v_idx]
-
-        step_matched = 0
-        qos_reward = 0.0
-
-        if action['action_type'] == ActionType.REJECT:
-            self.status_map.get(vehicle.status, 1)
-            vehicle.current_request = {'type': 'reject'}
-
-        elif action['action_type'] == ActionType.MATCHING:
-            p_idx = action['discrete_index']
-            if 0 <= p_idx < len(self.passengers):
-                p = self.passengers[p_idx]
-                if p.pickup_time is None:
-                    p.pickup_time = self.curr_time
-                    vehicle.add_passenger(p)
-                    self.matched_ids.add(p.id)
-                    step_matched += 1
-                    self.passengers.remove(p)
-                    self.waiting_passenger_count[p.start] -= 1
-
-                    path_to_pickup = self.network.get_shortest_path(
-                        vehicle.current_location, p.start
-                    )
-                    path_to_dropoff = self.network.get_shortest_path(
-                        p.start, p.end
-                    )
-                    full_path = path_to_pickup + path_to_dropoff[1:]
-                    vehicle.current_path = full_path
-
-                    if len(full_path) > 1:
-                        vehicle.remaining_travel_time = self.network.get_travel_time(
-                            [full_path[0], full_path[1]]
-                        )
-                    else:
-                        vehicle.remaining_travel_time = 0
-
-                    self.status_map.get(vehicle.status, 2)
-                    vehicle.current_request = {'type': 'pickup', 'passenger_id': p.id}
-
-        dropped = vehicle.move_to_next_location()
-        if dropped:
-            self.status_map.get(vehicle.status, 3)
-            vehicle.current_request = {'type': 'dropoff',
-                                       'passenger_ids': [p.id for p in dropped]}
-
-        for p in list(self.passengers):
-            if p.start == vehicle.current_location and p.pickup_time is None:
-                if vehicle.add_passenger(p):
-                    p.pickup_time = self.curr_time
-                    self.matched_ids.add(p.id)
-                    step_matched += 1
-                    self.passengers.remove(p)
-                    self.status_map.get(vehicle.status, 2)
-
-        cumulative = len(self.matched_ids) + len(self.canceled_ids) + len(self.passengers)
-        matched_ratio = len(self.matched_ids) / cumulative if cumulative > 0 else 0
-        matched_reward = step_matched * self.base_fare * matched_ratio
-
-        step_drop = len(dropped)
-        dropoff_ratio = (self.dropped_passengers / len(self.matched_ids)
-                         if len(self.matched_ids) > 0 else 0)
-        dropoff_reward = step_drop * self.base_fare * 1.2 * dropoff_ratio
-
-        for p in dropped:
-            if p.pickup_time is not None and p.dropoff_time == self.curr_time:
-                t_wait = max(0, p.pickup_time - p.request_time)
-                trav = p.dropoff_time - p.pickup_time
-                detour = max(0, trav - p.direct_route_time)
-                qos_reward -= (t_wait + detour)
-
-        # moving_vehicles = sum(1 for v in self.vehicles if v.remaining_travel_time > 0)
-        # emmision_reward = - moving_vehicles
-
-        reward = matched_reward + dropoff_reward + qos_reward
-
-        # reward = np.clip(reward, -5.0, 5.0)
-        return reward
-
-    def generate_passengers_for_current_time(self):
-        if self.curr_time <= self.max_request_time:
-            new = self.all_request_list[self.all_request_list['Request_time'] == self.curr_time]
-            existing_ids = {p.id for p in self.passengers}
-            for _, row in new.iterrows():
-                if row['User_ID'] not in existing_ids:
-                    p = Passenger(row['User_ID'], row['Start_node'], row['End_node'], row['Request_time'], self.network)
-                    self.passengers.append(p)
-                    self.waiting_passenger_count[p.start] += 1
-
-    def update_current_requirement(self):
-        if self.curr_time <= self.max_request_time:
-            self.generate_passengers_for_current_time()
-        cancel_limit = 10
-        for p in list(self.passengers):
-            if p.pickup_time is None and (self.curr_time - p.request_time) > cancel_limit:
-                self.canceled_ids.add(p.id)
-                self.passengers.remove(p)
-
-    def step(self, veh_i, act):
-        # self.get_current_requirement()
-        reward = self.single_action(veh_i, act)
-
-        next_state = self.get_state()
-        return reward, next_state
+    # next_state, reward, done 을 기본적으로 리턴
+    # def step(self, action):
+    #     vehicle_idx = action[0]
+    #     action_idx = action[1]
+    #     curr_veh = self.vehicle_list[vehicle_idx]
+    #
+    #     if action_idx == 20: # Reject
+    #         curr_veh.status = VehicleStatus.REJECT
+    #     else: # Matching

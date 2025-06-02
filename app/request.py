@@ -23,6 +23,7 @@ class Request:
         self.waiting_time = -1
         self.time_to_deadline = -1
         self.assigned_v_id = -1
+        self.slot_idx = -1
 
     def __str__(self):
         return (f"Request(request_id={self.request_id}, "
@@ -37,7 +38,7 @@ class Request:
         self.travel_time = travel_time
         self.deadline = self.request_time + self.travel_time + Request.ARRIVAL_TOLERANCE_TIME
 
-    def get_state(self):
+    def get_vector(self):
         num_nodes = self.network.num_nodes
 
         vec_status = [0] * RequestStatus.NUM_CLASSES

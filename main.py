@@ -60,64 +60,45 @@ def main():
         step_logs = []
         env = RideSharingEnvironment(
             network=network,
-            request_list=request_list,
-            vehicle_positions=vehicle_positions
+            original_request_list=request_list,
+            vehicle_init_pos=vehicle_positions
         )
 
-        total_reward = 0.0
-        total_loss = 0.0
-        prev_dropped = 0
+        # total_reward = 0.0
+        # total_loss = 0.0
+        # prev_dropped = 0
+
         done = False
+        time_updated = False
+
+        state = env.reset()
 
         while not done:
             print('Curr Time : {}'.format(env.curr_time))
-            env.enqueue_requests()   # 시간이 갱신될 때마다 호출
+            print(state[0].shape)
+            print(state[1].shape)
+            print(state[2].shape)
 
-            env.update_np_states()
             action_mask = env.get_action_mask()
-            pprint(action_mask)
-            # print(action_mask.shape)
+            # pprint(action_mask)
 
-            curr_veh = np.expand_dims(env.vehicle_np_states, axis=0)
-            curr_req = np.expand_dims(env.request_np_states, axis=0)
-            curr_rel = np.expand_dims(env.relation_np_states, axis=0)
-            model_input = [curr_veh, curr_req, curr_rel]
-            q_values = agent.model.predict(model_input)
-            # print(q_values)
-            # print(type(q_values))
-            # print(q_values.shape)
+            action = agent.act(state, action_mask)
+            print(action)
 
-            masked_q = tf.where(action_mask == 1, q_values, tf.float32.min)
-            # print(masked_q)
-            # print(masked_q.shape)
+            # 뒤쪽 로직에서 agent 가 action 했는데 할 수 있는 action이 없으면
+            # 특별한 값 리턴하고, 그걸 감지해서 환경은 그에 맞게 업데이트 하고
+            # 그에 알맞은 next_state를 반환한 뒤 다시 루프를 진행한다.
+            # 여기서 env.handle_time_update() 같은게 호출 되어야 함
 
-            valid_actions = tf.where(action_mask == 1)
-            print(valid_actions)
-            rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
-            print(rand_idx)
-            rand_action = valid_actions[rand_idx]
-            print(rand_action)
-            rand_action = rand_action.numpy()
-            vehicle_idx = rand_action[0]
-            action_idx = rand_action[1]
-            print("vehicle index:", vehicle_idx)
-            print("action index:", action_idx)
-
-            flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
-            print(flat_idx)
-            vehicle_idx = flat_idx // cfg.POSSIBLE_ACTION
-            action_idx = flat_idx % cfg.POSSIBLE_ACTION
-            print("vehicle index:", vehicle_idx)
-            print("action index:", action_idx)
             return
 
             # st = env.get_state()
             # st = env.flatten_state(st)
             # env.update_current_requirement()
             # print(env.time)
-            while any(v.status == 'idle' for v in env.vehicles):
+            while any(v.status == 'idle' for v in env.vehicle_list):
                 batch_states = np.tile(st, (NUM_VEHICLES, 1))
-                veh_i, act = agent.act(batch_states, env.vehicles)
+                veh_i, act = agent.act(batch_states, env.vehicle_list)
 
                 pprint(act)
                 reward, next_state = env.step(veh_i, act)
@@ -136,7 +117,7 @@ def main():
 
             env.curr_time += 1
 
-            for v in env.vehicles:
+            for v in env.vehicle_list:
                 env.status_map.get(v.status, 0)
 
             done = (env.curr_time >= 60)

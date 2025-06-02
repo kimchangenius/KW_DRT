@@ -30,7 +30,7 @@ class Vehicle:
             num_curr_passengers += r.num_passengers
         return cfg.VEH_CAPACITY - num_curr_passengers
 
-    def get_state(self):
+    def get_vector(self):
         num_nodes = self.network.num_nodes
 
         vec_status = [0] * VehicleStatus.NUM_CLASSES

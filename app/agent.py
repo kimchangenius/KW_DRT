@@ -14,8 +14,8 @@ from tensorflow.python.distribute.combinations import tf_function
 class DQNAgent:
     def __init__(self, hidden_dim, max_episodes=500):
         self.hidden_dim = hidden_dim
-        self.model = self.build_drt_dqn_pairwise_model()
-        self.target_model = self.build_drt_dqn_pairwise_model()
+        self.model = self.build_model()
+        self.target_model = self.build_model()
 
         self.num_reject = 1
         self.num_matching = 20
@@ -58,7 +58,7 @@ class DQNAgent:
         else:
             print(f"No model weights loaded at{file_path}")
 
-    def build_drt_dqn_pairwise_model(self):
+    def build_model(self):
         vehicle_input = Input(shape=(cfg.NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")  # (B, V, Dv)
         request_input = Input(shape=(cfg.NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")  # (B, R, Dr)
         relation_input = Input(shape=(cfg.NUM_VEHICLES, cfg.NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input") # (B, V, R, Drel)
@@ -91,6 +91,21 @@ class DQNAgent:
 
         return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_total)
 
+    def act(self, state, action_mask):
+        if np.random.rand() < self.epsilon:
+            valid_actions = tf.where(action_mask == 1)
+            rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
+            rand_action = valid_actions[rand_idx]
+            rand_action = rand_action.numpy()
+            return [int(rand_action[0]), int(rand_action[1]), 'explore']
+        else:
+            q_values = self.model.predict(state)
+            masked_q = tf.where(action_mask == 1, q_values, tf.float32.min)
+            flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
+            vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
+            action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
+            return [vehicle_idx, action_idx, 'exploit']
+
     @tf_function
     def predict_q_all(self, states: tf.Tensor) -> tf.Tensor:
         return self.model(states, training=False)
@@ -98,66 +113,6 @@ class DQNAgent:
     @tf_function
     def predict_target_q_all(self, states: tf.Tensor) -> tf.Tensor:
         return self.target_model(states, training=False)
-
-    def act(self, flat_states: np.ndarray, vehicles: list):
-        batch = tf.convert_to_tensor(flat_states, dtype=tf.float32)
-        q_all = self.predict_q_all(batch).numpy()
-
-        n_v = flat_states.shape[0]
-        req_flat_start = self.state_size - 20 * 3
-        requests_flat = flat_states[:, req_flat_start:]
-        request_times = requests_flat.reshape(n_v, 20, 3)[:, :, 2]
-
-        for i in range(n_v):
-            for m in range(self.num_matching):
-                if request_times[i, m] < 0:
-                    q_all[i, 1 + m] = -np.inf
-
-        for i, v in enumerate(vehicles):
-            if v.status != 'idle':
-                q_all[i, :] = -np.inf
-
-        idle_idxs = [i for i, v in enumerate(vehicles) if v.status == 'idle']
-        valid_pairs = []
-        for i in idle_idxs:
-            for j, q in enumerate(q_all[i]):
-                if not np.isneginf(q):
-                    valid_pairs.append((i, j))
-
-        # ε-greedy 탐색 or 활용
-        if np.random.rand() < self.epsilon and valid_pairs:
-            veh_i, idx = random.choice(valid_pairs)
-        else:
-            flat_q = q_all.reshape(-1)
-            if np.all(np.isneginf(flat_q)):
-                veh_i = random.choice(idle_idxs) if idle_idxs else 0
-                idx = 0
-            else:
-                best_flat = int(np.argmax(flat_q))
-                veh_i = best_flat // self.total_actions
-                idx = best_flat % self.total_actions
-
-        # action dict 생성
-        if idx < self.num_reject:
-            act = {
-                'action_type': ActionType.REJECT,
-                'discrete_index': 0,
-                'parameter': None
-            }
-        elif idx < self.num_reject + self.num_matching:
-            act = {
-                'action_type': ActionType.MATCHING,
-                'discrete_index': idx - self.num_reject,
-                'parameter': None
-            }
-        else:
-            act = {
-                'action_type': ActionType.REBALANCING,
-                'discrete_index': idx - self.num_reject - self.num_matching,
-                'parameter': None
-            }
-
-        return veh_i, act
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
