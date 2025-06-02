@@ -22,6 +22,7 @@ class Request:
         self.status = RequestStatus.PENDING
         self.waiting_time = -1
         self.time_to_deadline = -1
+        self.assigned_v_id = -1
 
     def __str__(self):
         return (f"Request(request_id={self.request_id}, "

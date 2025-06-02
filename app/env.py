@@ -6,6 +6,7 @@ from app.passenger import Passenger
 from app.request_status import RequestStatus
 from app.vehicle import Vehicle
 from app.action_type import ActionType
+from app.vehicle_status import VehicleStatus
 
 
 class RideSharingEnvironment:
@@ -102,22 +103,51 @@ class RideSharingEnvironment:
         # print(self.relation_np_states.shape)
         # print(self.relation_np_states.dtype)
 
-
     def get_action_mask(self):
         """
-        현재의 아래 state를 기준으로 q-value mask를 계산
-        - self.request_states
-        - self.vehicle_states
-
         Masking Rule
-        - dummy request
-        - non-idle vehicle
-        - impossible request
-            - 최대 대기 시간 = 10분 내에 도달 못감
-            - 좌석 부족
+        - Non-idle vehicle
+        - Request
+            - Non-Pending vehicle
+            - Seat Not available
+        - Dummy request
 
         """
-        return
+        all_list = []
+        for v in self.vehicles:
+            v_row = []
+
+            # 현재 차량이 Non-idle
+            if v.status != VehicleStatus.IDLE:
+                v_row.append([0] * cfg.POSSIBLE_ACTION)
+                continue
+
+            # 현재 차량이 Idle, 현재 request가 Dummy가 아닐 경우
+            for r in self.requests:
+                # 현재 request가 이미 해당 차량에 assigned된 경우, 즉 drop off 대상
+                if r.status == RequestStatus.PICKEDUP:
+                    if r.assigned_v_id == v.id:
+                        v_row.append(1)
+                    else:
+                        v_row.append(0)
+                elif r.status == RequestStatus.PENDING:
+                    if v.get_available_seats() >= r.num_passengers:
+                        v_row.append(1)
+                    else:
+                        v_row.append(0)
+                else:
+                    v_row.append(0)
+
+            # 현재 request가 Dummy 일 경우
+            missing = cfg.NUM_REQUEST - len(self.requests)
+            if missing > 0:
+                v_row.extend([0] * missing)
+
+            # Reject 추가
+            v_row.append(1)
+            assert len(v_row) == cfg.POSSIBLE_ACTION, "Action mask length mismatch"
+            all_list.append(v_row)
+        return np.array(all_list, dtype=np.float32)
 
 
     def get_state(self):

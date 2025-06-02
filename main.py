@@ -2,6 +2,8 @@ import os
 import csv
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+import app.config as cfg
 
 from pprint import pprint
 from app.env import RideSharingEnvironment
@@ -72,14 +74,41 @@ def main():
             env.enqueue_requests()   # 시간이 갱신될 때마다 호출
 
             env.update_np_states()
+            action_mask = env.get_action_mask()
+            pprint(action_mask)
+            # print(action_mask.shape)
+
             curr_veh = np.expand_dims(env.vehicle_np_states, axis=0)
             curr_req = np.expand_dims(env.request_np_states, axis=0)
             curr_rel = np.expand_dims(env.relation_np_states, axis=0)
             model_input = [curr_veh, curr_req, curr_rel]
-            output = agent.model.predict(model_input)
-            print(output)
-            print(type(output))
-            print(output.shape)
+            q_values = agent.model.predict(model_input)
+            # print(q_values)
+            # print(type(q_values))
+            # print(q_values.shape)
+
+            masked_q = tf.where(action_mask == 1, q_values, tf.float32.min)
+            # print(masked_q)
+            # print(masked_q.shape)
+
+            valid_actions = tf.where(action_mask == 1)
+            print(valid_actions)
+            rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
+            print(rand_idx)
+            rand_action = valid_actions[rand_idx]
+            print(rand_action)
+            rand_action = rand_action.numpy()
+            vehicle_idx = rand_action[0]
+            action_idx = rand_action[1]
+            print("vehicle index:", vehicle_idx)
+            print("action index:", action_idx)
+
+            flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
+            print(flat_idx)
+            vehicle_idx = flat_idx // cfg.POSSIBLE_ACTION
+            action_idx = flat_idx % cfg.POSSIBLE_ACTION
+            print("vehicle index:", vehicle_idx)
+            print("action index:", action_idx)
             return
 
             # st = env.get_state()

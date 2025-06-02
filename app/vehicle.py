@@ -5,7 +5,7 @@ from app.vehicle_status import VehicleStatus
 
 class Vehicle:
     def __init__(self, veh_id, curr_node, network):
-        self.id = veh_id
+        self.id = veh_id        # 0부터 N-1까지 값을 가짐
         self.network = network
 
         self.status = VehicleStatus.IDLE
@@ -24,6 +24,12 @@ class Vehicle:
                 f"curr={self.curr_node}, next={self.next_node}, "
                 f"status={self.status}")
 
+    def get_available_seats(self):
+        num_curr_passengers = 0
+        for r in self.curr_requests:
+            num_curr_passengers += r.num_passengers
+        return cfg.VEH_CAPACITY - num_curr_passengers
+
     def get_state(self):
         num_nodes = self.network.num_nodes
 
@@ -39,10 +45,7 @@ class Vehicle:
         if 1 <= self.next_node <= num_nodes:
             vec_to[self.next_node - 1] = 1
 
-        num_curr_passengers = 0
-        for r in self.curr_requests:
-            num_curr_passengers += r.num_passengers
-        vec_capa = [(cfg.VEH_CAPACITY - num_curr_passengers) / cfg.VEH_CAPACITY]
+        vec_capa = [self.get_available_seats() / cfg.VEH_CAPACITY]
 
         vec_all = vec_status + vec_from + vec_to + vec_capa
         return vec_all
