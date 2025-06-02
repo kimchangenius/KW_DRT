@@ -15,6 +15,7 @@ class RideSharingEnvironment:
         self.vehicle_init_pos = vehicle_init_pos
 
         self.curr_time = None
+        self.curr_step = None
         self.todo_request_list = None   # request들 중 미래에 들어올 것들 (정렬되어 있음)
 
         self.vehicle_list = None
@@ -27,6 +28,7 @@ class RideSharingEnvironment:
 
     def reset(self):
         self.curr_time = 0
+        self.curr_step = 0
         self.todo_request_list = copy.deepcopy(self.original_request_list)
 
         self.vehicle_list = []
@@ -35,8 +37,15 @@ class RideSharingEnvironment:
         self.initialize_vehicles()
         self.handle_time_update()
         self.sync_state()
-
         return self.state
+
+    def print_vehicles(self):
+        for v in self.vehicle_list:
+            print(v)
+
+    def print_requests(self):
+        for r in self.request_list:
+            print(r)
 
     def initialize_vehicles(self):
         for idx, pos in enumerate(self.vehicle_init_pos):
@@ -45,17 +54,41 @@ class RideSharingEnvironment:
 
     # 시간이 업데이트 될 때 필요한 모든 것들을 업데이트 함
     def handle_time_update(self):
+        # 현재 시간에 들어올 새로운 요청을 추가
         while self.todo_request_list and self.todo_request_list[0].request_time <= self.curr_time:
             r = self.todo_request_list.pop(0)
             r.waiting_time = self.curr_time - r.request_time
-            r.time_to_deadline = r.deadline - self.curr_time
+            r.time_to_deadline = r.arrival_deadline - self.curr_time
             self.request_list.append(r)
-
         for idx, r in enumerate(self.request_list):
             r.slot_idx = idx
 
-        # TODO: 현재 시간에 하던일을 마무리하는 것들에 대한 처리도 여기서 구현해야 함
-        # TODO: Request 마다 대기 시간 같은 것들도 업데이트 해줘야 함
+        # Vehicle 상태 업데이트
+        for v in self.vehicle_list:
+            if v.status == VehicleStatus.REJECT:
+                # REJECT이면 IDLE로 전환
+                v.status = VehicleStatus.IDLE
+            if v.status == VehicleStatus.PICKUP:
+                if v.target_arrival_time == self.curr_time:
+                    # 이번 시간에 pickup 도착했으면
+                    v.status = VehicleStatus.IDLE
+                    v.target_arrival_time = -1
+                    v.curr_node = v.next_node
+                    v.next_node = 0
+
+            if v.status == VehicleStatus.DROPOFF:
+                if v.target_arrival_time == self.curr_time:
+                    # 이번 시간에 dropoff 도착했으면
+                    v.status = VehicleStatus.IDLE
+                    v.target_arrival_time = -1
+                    v.active_requests.remove(v.target_request)
+                    v.curr_node = v.next_node
+                    v.next_node = 0
+
+        # TODO: Request 상태 업데이트 (대기 시간 등...)
+
+
+
 
 
     # 기존에 가진 자료구조들을 토대로 state 형태로 만들어주기만 하는 역할
@@ -88,7 +121,7 @@ class RideSharingEnvironment:
             v_list = []
             for r in self.request_list:
                 need_drop_off = 0
-                if r in v.curr_requests:
+                if r in v.active_requests:
                     need_drop_off = 1
 
                 if r.status == RequestStatus.PENDING:
@@ -129,13 +162,13 @@ class RideSharingEnvironment:
         """
         all_list = []
         for v in self.vehicle_list:
-            v_row = []
 
             # 현재 차량이 Non-idle
             if v.status != VehicleStatus.IDLE:
-                v_row.append([0] * cfg.POSSIBLE_ACTION)
+                all_list.append([0] * cfg.POSSIBLE_ACTION)
                 continue
 
+            v_row = []
             # 현재 차량이 Idle, 현재 request가 Dummy가 아닐 경우
             for r in self.request_list:
                 # 현재 request가 이미 해당 차량에 assigned된 경우, 즉 drop off 대상
@@ -168,28 +201,45 @@ class RideSharingEnvironment:
         print('Env: current action : {}'.format(action))
         vehicle_idx = action[0]
         action_idx = action[1]
-        curr_veh = self.vehicle_list[vehicle_idx]
+        v = self.vehicle_list[vehicle_idx]
 
         curr_reward = 0
         done = False
 
-        if action_idx == 20: # Reject
-            curr_veh.status = VehicleStatus.REJECT
-        else: # Matching
+        if action_idx == 20:
+            # Reject
+            v.status = VehicleStatus.REJECT
+        else:
+            # Matching
             # 어떤 요청이 채택된 경우 - Pickup 하러 가거나 Dropoff 하러 가야 함
-            curr_request = self.request_list[action_idx]
-            if curr_request not in curr_veh.curr_requests:
+            r = self.request_list[action_idx]
+            if r not in v.active_requests:
                 # Pickup 하러 가야하는 경우
-                curr_veh.status = VehicleStatus.PICKUP
-                curr_veh.curr_requests.append(curr_request)
-                curr_veh.next_node = curr_request.from_node_id
-                curr_request.status = RequestStatus.ACCEPTED
+                v.status = VehicleStatus.PICKUP
+                v.active_requests.append(r)
+                v.next_node = r.from_node_id
+                v.target_request = r
+                v.target_arrival_time = self.curr_time + self.network.get_duration(v.curr_node, v.next_node)
+
+                r.status = RequestStatus.ACCEPTED
+                r.assigned_v_id = v.id
+
                 curr_reward += 1
             else:
                 # Dropoff 하러 가야하는 경우
-                curr_veh.status = VehicleStatus.DROPOFF
-                curr_veh.next_node = curr_request.to_node_id
+                v.status = VehicleStatus.DROPOFF
+                v.next_node = r.to_node_id
+                v.target_request = r
+                v.target_arrival_time = self.curr_time + self.network.get_duration(v.curr_node, v.next_node)
 
         self.sync_state()
+        self.curr_step += 1
 
         return self.state, curr_reward, done
+
+    def has_idle_vehicle(self):
+        has = False
+        for v in self.vehicle_list:
+            if v.status == VehicleStatus.IDLE:
+                has = True
+        return has

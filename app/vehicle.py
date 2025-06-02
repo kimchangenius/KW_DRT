@@ -11,16 +11,23 @@ class Vehicle:
         self.status = VehicleStatus.IDLE
         self.curr_node = curr_node
         self.next_node = 0
-        self.curr_requests = []
+
+        self.active_requests = []
+        self.target_request = None
+        self.target_arrival_time = -1
 
     def __str__(self):
-        return (f"Vehicle(veh_id={self.id}, "
-                f"curr={self.curr_node}, next={self.next_node}, "
-                f"status={self.status}")
+        return (f"[V](id={self.id} / "
+                f"{self.curr_node} -> {self.next_node} / "
+                f"target_r={self.target_request.request_id if self.target_request else 'None'} / "
+                f"status={self.status} / "
+                f"arr_time={self.target_arrival_time} / "
+                f"active_r_num={len(self.active_requests)})"
+                )
 
     def get_available_seats(self):
         num_curr_passengers = 0
-        for r in self.curr_requests:
+        for r in self.active_requests:
             num_curr_passengers += r.num_passengers
         return cfg.VEH_CAPACITY - num_curr_passengers
 

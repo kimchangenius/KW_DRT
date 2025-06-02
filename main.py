@@ -56,14 +56,15 @@ def main():
 
     episode_logs = []
     episodes = 1
-    for ep in range(episodes):
-        step_logs = []
-        env = RideSharingEnvironment(
-            network=network,
-            original_request_list=request_list,
-            vehicle_init_pos=vehicle_positions
-        )
 
+    env = RideSharingEnvironment(
+        network=network,
+        original_request_list=request_list,
+        vehicle_init_pos=vehicle_positions
+    )
+
+    for ep in range(episodes):
+        # step_logs = []
         # total_reward = 0.0
         # total_loss = 0.0
         # prev_dropped = 0
@@ -72,60 +73,66 @@ def main():
         time_updated = False
 
         state = env.reset()
+        # print(state[0].shape)
+        # print(state[1].shape)
+        # print(state[2].shape)
 
         while not done:
-            print('Curr Time : {}'.format(env.curr_time))
-            print(state[0].shape)
-            print(state[1].shape)
-            print(state[2].shape)
+            print('\n============ Time : {} ============'.format(env.curr_time))
+            env.print_vehicles()
+            env.print_requests()
 
-            action_mask = env.get_action_mask()
-            # pprint(action_mask)
+            while env.has_idle_vehicle():
+                print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
+                action_mask = env.get_action_mask()
+                print(action_mask)
+                action = agent.act(state, action_mask)
+                next_state, reward, done = env.step(action)
 
-            action = agent.act(state, action_mask)
-            next_state, reward, done = env.step(action)
-            # print(next_state.shape)
-            print(reward)
-            print(done)
+                # print(next_state.shape)
+                print(reward)
+                env.print_vehicles()
+                env.print_requests()
 
-            # 뒤쪽 로직에서 agent 가 action 했는데 할 수 있는 action이 없으면
-            # 특별한 값 리턴하고, 그걸 감지해서 환경은 그에 맞게 업데이트 하고
-            # 그에 알맞은 next_state를 반환한 뒤 다시 루프를 진행한다.
-            # 여기서 env.handle_time_update() 같은게 호출 되어야 함
-
-            return
-
-            # st = env.get_state()
-            # st = env.flatten_state(st)
-            # env.update_current_requirement()
-            # print(env.time)
-            while any(v.status == 'idle' for v in env.vehicle_list):
-                batch_states = np.tile(st, (NUM_VEHICLES, 1))
-                veh_i, act = agent.act(batch_states, env.vehicle_list)
-
-                pprint(act)
-                reward, next_state = env.step(veh_i, act)
-                total_reward += reward
-
-                pprint(next_state)
-                s = np.concatenate([batch_states[veh_i]])
-                s_next = env.flatten_state(next_state)
-                agent.remember(s.reshape(1, -1), [act], reward, s_next.reshape(1, -1), done)
-                loss = agent.replay()
-                if loss is None:
-                    loss = 0.0
-                total_loss += loss
-
-                st = s_next
+                state = next_state
 
             env.curr_time += 1
 
-            for v in env.vehicle_list:
-                env.status_map.get(v.status, 0)
+            # idle vehicle이 없는 상황
+            env.handle_time_update()
+            env.sync_state()
+            state = env.state
 
-            done = (env.curr_time >= 60)
-            if done:
-                break
+            if env.curr_time == 3:
+                return
+
+            # while any(v.status == 'idle' for v in env.vehicle_list):
+            #     batch_states = np.tile(st, (NUM_VEHICLES, 1))
+            #     veh_i, act = agent.act(batch_states, env.vehicle_list)
+            #
+            #     pprint(act)
+            #     reward, next_state = env.step(veh_i, act)
+            #     total_reward += reward
+            #
+            #     pprint(next_state)
+            #     s = np.concatenate([batch_states[veh_i]])
+            #     s_next = env.flatten_state(next_state)
+            #     agent.remember(s.reshape(1, -1), [act], reward, s_next.reshape(1, -1), done)
+            #     loss = agent.replay()
+            #     if loss is None:
+            #         loss = 0.0
+            #     total_loss += loss
+            #
+            #     st = s_next
+            #
+            # env.curr_time += 1
+            #
+            # for v in env.vehicle_list:
+            #     env.status_map.get(v.status, 0)
+            #
+            # done = (env.curr_time >= 60)
+            # if done:
+            #     break
 
         agent.decay_epsilon(ep, episodes)
 
