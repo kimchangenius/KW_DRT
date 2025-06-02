@@ -83,7 +83,10 @@ def main():
             # pprint(action_mask)
 
             action = agent.act(state, action_mask)
-            print(action)
+            next_state, reward, done = env.step(action)
+            # print(next_state.shape)
+            print(reward)
+            print(done)
 
             # 뒤쪽 로직에서 agent 가 action 했는데 할 수 있는 action이 없으면
             # 특별한 값 리턴하고, 그걸 감지해서 환경은 그에 맞게 업데이트 하고

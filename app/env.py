@@ -54,6 +54,10 @@ class RideSharingEnvironment:
         for idx, r in enumerate(self.request_list):
             r.slot_idx = idx
 
+        # TODO: 현재 시간에 하던일을 마무리하는 것들에 대한 처리도 여기서 구현해야 함
+        # TODO: Request 마다 대기 시간 같은 것들도 업데이트 해줘야 함
+
+
     # 기존에 가진 자료구조들을 토대로 state 형태로 만들어주기만 하는 역할
     # 이 안에서 상태가 바뀌거나 업데이트가 되어서는 안됨
     def sync_state(self):
@@ -67,7 +71,6 @@ class RideSharingEnvironment:
 
         all_list = []
         for r in self.request_list:
-            print(r)
             all_list.append(r.get_vector())
 
         missing = cfg.NUM_REQUEST - len(all_list)
@@ -161,11 +164,32 @@ class RideSharingEnvironment:
         return np.array(all_list, dtype=np.float32)
 
     # next_state, reward, done 을 기본적으로 리턴
-    # def step(self, action):
-    #     vehicle_idx = action[0]
-    #     action_idx = action[1]
-    #     curr_veh = self.vehicle_list[vehicle_idx]
-    #
-    #     if action_idx == 20: # Reject
-    #         curr_veh.status = VehicleStatus.REJECT
-    #     else: # Matching
+    def step(self, action):
+        print('Env: current action : {}'.format(action))
+        vehicle_idx = action[0]
+        action_idx = action[1]
+        curr_veh = self.vehicle_list[vehicle_idx]
+
+        curr_reward = 0
+        done = False
+
+        if action_idx == 20: # Reject
+            curr_veh.status = VehicleStatus.REJECT
+        else: # Matching
+            # 어떤 요청이 채택된 경우 - Pickup 하러 가거나 Dropoff 하러 가야 함
+            curr_request = self.request_list[action_idx]
+            if curr_request not in curr_veh.curr_requests:
+                # Pickup 하러 가야하는 경우
+                curr_veh.status = VehicleStatus.PICKUP
+                curr_veh.curr_requests.append(curr_request)
+                curr_veh.next_node = curr_request.from_node_id
+                curr_request.status = RequestStatus.ACCEPTED
+                curr_reward += 1
+            else:
+                # Dropoff 하러 가야하는 경우
+                curr_veh.status = VehicleStatus.DROPOFF
+                curr_veh.next_node = curr_request.to_node_id
+
+        self.sync_state()
+
+        return self.state, curr_reward, done
