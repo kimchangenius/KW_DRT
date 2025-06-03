@@ -1,6 +1,6 @@
 import app.config as cfg
 
-from app.vehicle_status import VehicleStatus
+from app.vehicle_status import VehicleStatus, VEHICLE_STATUS_NUM_CLASSES
 
 
 class Vehicle:
@@ -14,6 +14,7 @@ class Vehicle:
         self.active_request_list = []
         self.target_request = None
         self.target_arrival_time = -1
+        self.num_passengers = 0
 
     def __str__(self):
         return (f"[V](id={self.id} / "
@@ -21,20 +22,15 @@ class Vehicle:
                 f"target_r={self.target_request.id if self.target_request else 'None'} / "
                 f"status={self.status} / "
                 f"at={self.target_arrival_time} / "
+                f"np={self.num_passengers} / "
                 f"active_r_num={len(self.active_request_list)})"
                 )
-
-    def get_available_seats(self):
-        num_curr_passengers = 0
-        for r in self.active_request_list:
-            num_curr_passengers += r.num_passengers
-        return cfg.VEH_CAPACITY - num_curr_passengers
 
     def get_vector(self):
         num_nodes = self.network.num_nodes
 
-        vec_status = [0] * VehicleStatus.NUM_CLASSES
-        if 1 <= self.status <= VehicleStatus.NUM_CLASSES:
+        vec_status = [0] * VEHICLE_STATUS_NUM_CLASSES
+        if 1 <= self.status <= VEHICLE_STATUS_NUM_CLASSES:
             vec_status[self.status - 1] = 1
 
         vec_from = [0] * num_nodes
@@ -45,7 +41,7 @@ class Vehicle:
         if 1 <= self.next_node <= num_nodes:
             vec_to[self.next_node - 1] = 1
 
-        vec_capa = [self.get_available_seats() / cfg.VEH_CAPACITY]
+        vec_capa = [(cfg.VEH_CAPACITY - self.num_passengers) / cfg.VEH_CAPACITY]
 
         vec_all = vec_status + vec_from + vec_to + vec_capa
         return vec_all

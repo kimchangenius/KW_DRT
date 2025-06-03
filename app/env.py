@@ -49,12 +49,31 @@ class RideSharingEnvironment:
         for v in self.vehicle_list:
             print(v)
 
-    def print_requests(self):
+    def print_active_requests(self):
         print('Num Requests : {}'.format(len(self.active_request_list)))
         log = str(len(self.active_request_list))
         self.logs.append(log)
         for r in self.active_request_list:
             print(r)
+
+    def print_done_requests(self):
+        print('Num Requests : {}'.format(len(self.done_request_list)))
+        for r in self.done_request_list:
+            print(r)
+
+    def print_statistics(self):
+        num_served = 0
+        num_cancelled = 0
+        print("\n====================== Statistics ======================")
+        print('Request Done at Time : {}'.format(self.curr_time))
+        print('Num Requests : {}'.format(len(self.done_request_list)))
+        for r in self.done_request_list:
+            if r.status == RequestStatus.SERVED:
+                num_served += 1
+            if r.status == RequestStatus.CANCELLED:
+                num_cancelled += 1
+        print('Num Served : {}'.format(num_served))
+        print('Num Cancelled : {}'.format(num_cancelled))
 
     def print_logs(self):
         for l in self.logs:
@@ -62,9 +81,15 @@ class RideSharingEnvironment:
         self.logs = []
 
     def initialize_vehicles(self):
-        for idx, pos in enumerate(self.vehicle_init_pos):
+
+        for idx in range(cfg.MAX_NUM_VEHICLES):
+            pos = self.vehicle_init_pos[idx]
             veh = Vehicle(idx, pos, self.network)
             self.vehicle_list.append(veh)
+
+        # for idx, pos in enumerate(self.vehicle_init_pos):
+        #     veh = Vehicle(idx, pos, self.network)
+        #     self.vehicle_list.append(veh)
 
     # 시간이 업데이트 될 때 필요한 모든 것들을 업데이트 함
     def handle_time_update(self):
@@ -96,6 +121,9 @@ class RideSharingEnvironment:
                     if r.status == RequestStatus.CANCELLED:
                         v.active_request_list.remove(r)
                     else:
+                        v.num_passengers += r.num_passengers
+                        assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
+
                         # R 업데이트
                         r.status = RequestStatus.PICKEDUP
                         r.waiting_time = self.curr_time - r.request_time    # 마지막 확정 업데이트
@@ -113,9 +141,11 @@ class RideSharingEnvironment:
                     v.target_request = None
                     v.target_arrival_time = -1
                     v.active_request_list.remove(r)
+                    v.num_passengers -= r.num_passengers
+                    assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
                     # R 업데이트
-                    r.status = RequestStatus.FINISHED
+                    r.status = RequestStatus.SERVED
                     r.arrival_due_left = r.arrival_due - self.curr_time     # 마지막 확정 업데이트
                     r.in_vehicle_time = self.curr_time - r.pickup_at         # 마지막 확정 업데이트
                     r.dropoff_at = self.curr_time                         # 마지막 확정 업데이트
@@ -138,6 +168,7 @@ class RideSharingEnvironment:
 
         for cr in cancelled_list:
             self.active_request_list.remove(cr)
+            self.done_request_list.append(cr)
 
         for idx, r in enumerate(self.active_request_list):
             r.slot_idx = idx
@@ -244,7 +275,8 @@ class RideSharingEnvironment:
                     else:
                         v_row.append(0)
                 elif r.status == RequestStatus.PENDING:
-                    if v.get_available_seats() >= r.num_passengers:
+                    v_empty_seat = cfg.VEH_CAPACITY - v.num_passengers
+                    if v_empty_seat >= r.num_passengers:
                         v_row.append(1)
                     else:
                         v_row.append(0)
@@ -274,7 +306,7 @@ class RideSharingEnvironment:
         curr_reward = 0
         done = False
 
-        if action_idx == 20:
+        if action_idx == cfg.POSSIBLE_ACTION - 1:
             # Reject
             v.status = VehicleStatus.REJECT
         else:
@@ -300,6 +332,8 @@ class RideSharingEnvironment:
                     v.next_node = 0
                     v.target_request = None
                     v.target_arrival_time = -1
+                    v.num_passengers += r.num_passengers
+                    assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
                     r.status = RequestStatus.PICKEDUP
                     r.waiting_time = self.curr_time - r.request_time  # 마지막 확정 업데이트
@@ -319,14 +353,16 @@ class RideSharingEnvironment:
                     v.next_node = 0
                     v.target_request = None
                     v.target_arrival_time = -1
+                    v.active_request_list.remove(r)
+                    v.num_passengers -= r.num_passengers
+                    assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
-                    r.status = RequestStatus.FINISHED
+                    r.status = RequestStatus.SERVED
                     r.arrival_due_left = r.arrival_due - self.curr_time     # 마지막 확정 업데이트
                     r.in_vehicle_time = self.curr_time - r.pickup_at      # 마지막 확정 업데이트
                     r.dropoff_at = self.curr_time                         # 마지막 확정 업데이트
                     self.active_request_list.remove(r)
                     self.done_request_list.append(r)
-
 
 
         self.sync_state()
@@ -340,3 +376,8 @@ class RideSharingEnvironment:
             if v.status == VehicleStatus.IDLE:
                 has = True
         return has
+
+    def is_done(self):
+        if len(self.active_request_list) == 0 and len(self.future_request_list) == 0:
+            return True
+        return False

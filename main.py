@@ -77,10 +77,10 @@ def main():
         # print(state[1].shape)
         # print(state[2].shape)
 
-        while not done:
+        while True:
             print('\n============ Time : {} ============'.format(env.curr_time))
             env.print_vehicles()
-            env.print_requests()
+            env.print_active_requests()
 
             while env.has_idle_vehicle():
                 print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
@@ -92,20 +92,20 @@ def main():
                 # print(next_state.shape)
                 print(reward)
                 env.print_vehicles()
-                env.print_requests()
+                env.print_active_requests()
 
                 state = next_state
 
             env.curr_time += 1
-
-            # idle vehicle이 없는 상황
             env.handle_time_update()
+
+            if env.is_done():
+                env.print_statistics()
+                env.print_vehicles()
+                break
+
             env.sync_state()
             state = env.state
-
-            if env.curr_time == 70:
-                env.print_logs()
-                return
 
             # while any(v.status == 'idle' for v in env.vehicle_list):
             #     batch_states = np.tile(st, (NUM_VEHICLES, 1))
@@ -135,6 +135,7 @@ def main():
             # if done:
             #     break
 
+        return
         agent.decay_epsilon(ep, episodes)
 
             # dropped_this_step = env.dropped_passengers - prev_dropped

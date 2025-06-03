@@ -1,6 +1,6 @@
 import app.config as cfg
 
-from app.request_status import RequestStatus
+from app.request_status import RequestStatus, REQUEST_STATUS_NUM_CLASSES
 
 
 class Request:
@@ -41,6 +41,8 @@ class Request:
                 f"wt={self.waiting_time} / "
                 f"ivt={self.in_vehicle_time} / "
                 f"odt={self.travel_time} / "
+                f"pt={self.pickup_at} / "
+                f"dt={self.dropoff_at} / "
                 f"p_due={self.pickup_due} / "
                 f"a_due={self.arrival_due})"
                 )
@@ -53,8 +55,8 @@ class Request:
     def get_vector(self):
         num_nodes = self.network.num_nodes
 
-        vec_status = [0] * RequestStatus.NUM_CLASSES
-        if 1 <= self.status <= RequestStatus.NUM_CLASSES:
+        vec_status = [0] * REQUEST_STATUS_NUM_CLASSES
+        if 1 <= self.status <= REQUEST_STATUS_NUM_CLASSES:
             vec_status[self.status - 1] = 1
 
         vec_from = [0] * num_nodes
