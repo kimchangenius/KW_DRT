@@ -11,37 +11,44 @@ class Request:
         self.num_passengers = 1
 
         # 불변
-        self.request_id = request_id
+        self.id = request_id
         self.network = network
         self.from_node_id = from_node_id
         self.to_node_id = to_node_id
         self.request_time = request_time
         self.travel_time = -10000000
-        self.pickup_deadline = -1
-        self.arrival_deadline = -1
+        self.pickup_due = -1
+        self.arrival_due = -1
 
         # 가변 (매 시간 업데이트 필요)
         self.status = RequestStatus.PENDING
         self.waiting_time = -1
-        self.time_to_deadline = -1
+        self.in_vehicle_time = -1
+        self.arrival_due_left = -1
         self.assigned_v_id = -1
         self.slot_idx = -1
 
+        # 기록용
+        self.pickup_at = None
+        self.dropoff_at = None
+
     def __str__(self):
-        return (f"<R>(id={self.request_id} / "
+        return (f"<R>(id={self.id} / "
                 f"{self.from_node_id} -> {self.to_node_id} / "
                 f"status={self.status} / "
-                f"vehicle={self.assigned_v_id} / "
-                f"req_time={self.request_time} / "
-                f"od_dur={self.travel_time} / "
-                f"pick_dead={self.pickup_deadline} / "
-                f"arr_dead={self.arrival_deadline})"
+                f"veh={self.assigned_v_id} / "
+                f"rt={self.request_time} / "
+                f"wt={self.waiting_time} / "
+                f"ivt={self.in_vehicle_time} / "
+                f"odt={self.travel_time} / "
+                f"p_due={self.pickup_due} / "
+                f"a_due={self.arrival_due})"
                 )
 
     def set_travel_time(self, travel_time):
         self.travel_time = travel_time
-        self.pickup_deadline = self.request_time + Request.PICKUP_TOLERANCE_TIME
-        self.arrival_deadline = self.request_time + self.travel_time + Request.ARRIVAL_TOLERANCE_TIME
+        self.pickup_due = self.request_time + Request.PICKUP_TOLERANCE_TIME
+        self.arrival_due = self.request_time + self.travel_time + Request.ARRIVAL_TOLERANCE_TIME
 
     def get_vector(self):
         num_nodes = self.network.num_nodes
@@ -61,6 +68,6 @@ class Request:
         vec_passengers = [self.num_passengers / cfg.VEH_CAPACITY]
         vec_travel = [self.travel_time / self.network.max_duration]
         vec_wait = [self.waiting_time / cfg.MAX_WAIT_TIME]
-        vec_deadline = [self.time_to_deadline / (self.network.max_duration + Request.ARRIVAL_TOLERANCE_TIME)]
+        vec_deadline = [self.arrival_due_left / (self.network.max_duration + Request.ARRIVAL_TOLERANCE_TIME)]
         vec_all = vec_status + vec_from + vec_to + vec_passengers + vec_travel + vec_wait + vec_deadline
         return vec_all

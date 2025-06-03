@@ -8,3 +8,7 @@ class RequestStatus(IntEnum):
     PICKEDUP = 3    # 차량이 승객을 태운 상태, drop_off action 후보 가능 상태
 
     NUM_CLASSES = 3
+
+    # For Information Recording
+    CANCELLED = 4
+    FINISHED = 5

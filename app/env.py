@@ -16,23 +16,29 @@ class RideSharingEnvironment:
 
         self.curr_time = None
         self.curr_step = None
-        self.todo_request_list = None   # request들 중 미래에 들어올 것들 (정렬되어 있음)
+
+        self.future_request_list = None     # request들 중 미래에 들어올 것들 (정렬되어 있음)
+        self.active_request_list = None  # 현재 request 슬롯에 들어갈 것들 (최대 개수가 정해져있음)
+        self.done_request_list = None
 
         self.vehicle_list = None
-        self.request_list = None        # 현재 request 슬롯에 들어갈 것들 (최대 개수가 정해져있음)
 
         self.vehicle_state = None
         self.request_state = None
         self.relation_state = None
         self.state = None
 
+        self.logs = []
+
     def reset(self):
         self.curr_time = 0
         self.curr_step = 0
-        self.todo_request_list = copy.deepcopy(self.original_request_list)
+
+        self.future_request_list = copy.deepcopy(self.original_request_list)
+        self.active_request_list = []
+        self.done_request_list = []
 
         self.vehicle_list = []
-        self.request_list = []
 
         self.initialize_vehicles()
         self.handle_time_update()
@@ -44,8 +50,16 @@ class RideSharingEnvironment:
             print(v)
 
     def print_requests(self):
-        for r in self.request_list:
+        print('Num Requests : {}'.format(len(self.active_request_list)))
+        log = str(len(self.active_request_list))
+        self.logs.append(log)
+        for r in self.active_request_list:
             print(r)
+
+    def print_logs(self):
+        for l in self.logs:
+            print(l)
+        self.logs = []
 
     def initialize_vehicles(self):
         for idx, pos in enumerate(self.vehicle_init_pos):
@@ -54,46 +68,85 @@ class RideSharingEnvironment:
 
     # 시간이 업데이트 될 때 필요한 모든 것들을 업데이트 함
     def handle_time_update(self):
-        # 현재 시간에 들어올 새로운 요청을 추가
-        while self.todo_request_list and self.todo_request_list[0].request_time <= self.curr_time:
-            r = self.todo_request_list.pop(0)
-            r.waiting_time = self.curr_time - r.request_time
-            r.time_to_deadline = r.arrival_deadline - self.curr_time
-            self.request_list.append(r)
-        for idx, r in enumerate(self.request_list):
-            r.slot_idx = idx
+        # TODO: 여기서 발생한 reward를 적절히 과거 리플레이에 분배해주어야 함
 
-        # Vehicle 상태 업데이트
+        # 현재 시간에 들어올 새로운 요청을 추가
+        while self.future_request_list and self.future_request_list[0].request_time <= self.curr_time:
+            r = self.future_request_list.pop(0)
+            self.active_request_list.append(r)
+
+        # Vehicle 업데이트
         for v in self.vehicle_list:
             if v.status == VehicleStatus.REJECT:
                 # REJECT이면 IDLE로 전환
                 v.status = VehicleStatus.IDLE
+
             if v.status == VehicleStatus.PICKUP:
                 if v.target_arrival_time == self.curr_time:
                     # 이번 시간에 pickup 도착했으면
+                    r = v.target_request
+
+                    # V 업데이트
                     v.status = VehicleStatus.IDLE
-                    v.target_arrival_time = -1
                     v.curr_node = v.next_node
                     v.next_node = 0
+                    v.target_request = None
+                    v.target_arrival_time = -1
+
+                    if r.status == RequestStatus.CANCELLED:
+                        v.active_request_list.remove(r)
+                    else:
+                        # R 업데이트
+                        r.status = RequestStatus.PICKEDUP
+                        r.waiting_time = self.curr_time - r.request_time    # 마지막 확정 업데이트
+                        r.pickup_at = self.curr_time                      # 마지막 확정 업데이트
 
             if v.status == VehicleStatus.DROPOFF:
                 if v.target_arrival_time == self.curr_time:
                     # 이번 시간에 dropoff 도착했으면
+                    r = v.target_request
+
+                    # V 업데이트
                     v.status = VehicleStatus.IDLE
-                    v.target_arrival_time = -1
-                    v.active_requests.remove(v.target_request)
                     v.curr_node = v.next_node
                     v.next_node = 0
+                    v.target_request = None
+                    v.target_arrival_time = -1
+                    v.active_request_list.remove(r)
 
-        # TODO: Request 상태 업데이트 (대기 시간 등...)
+                    # R 업데이트
+                    r.status = RequestStatus.FINISHED
+                    r.arrival_due_left = r.arrival_due - self.curr_time     # 마지막 확정 업데이트
+                    r.in_vehicle_time = self.curr_time - r.pickup_at         # 마지막 확정 업데이트
+                    r.dropoff_at = self.curr_time                         # 마지막 확정 업데이트
+                    self.active_request_list.remove(r)
+                    self.done_request_list.append(r)
 
+        # Request 업데이트
+        cancelled_list = []
+        for r in self.active_request_list:
+            r.arrival_due_left = r.arrival_due - self.curr_time
+            if r.status == RequestStatus.PENDING or r.status == RequestStatus.ACCEPTED:
+                r.waiting_time = self.curr_time - r.request_time
 
+                # waiting_time 초과 확인
+                if r.waiting_time >= cfg.MAX_WAIT_TIME:
+                    r.status = RequestStatus.CANCELLED
+                    cancelled_list.append(r)
+            if r.status == RequestStatus.PICKEDUP:
+                r.in_vehicle_time = self.curr_time - r.pickup_at
 
+        for cr in cancelled_list:
+            self.active_request_list.remove(cr)
+
+        for idx, r in enumerate(self.active_request_list):
+            r.slot_idx = idx
 
 
     # 기존에 가진 자료구조들을 토대로 state 형태로 만들어주기만 하는 역할
     # 이 안에서 상태가 바뀌거나 업데이트가 되어서는 안됨
     def sync_state(self):
+        # Vehicle State 생성
         all_list = []
         for v in self.vehicle_list:
             all_list.append(v.get_vector())
@@ -102,26 +155,33 @@ class RideSharingEnvironment:
         # print(self.vehicle_state.shape)
         # print(self.vehicle_state.dtype)
 
+        # Request State 생성
         all_list = []
-        for r in self.request_list:
+        for idx, r in enumerate(self.active_request_list):
+            if idx >= cfg.MAX_NUM_REQUEST:
+                break
             all_list.append(r.get_vector())
 
-        missing = cfg.NUM_REQUEST - len(all_list)
+        missing = cfg.MAX_NUM_REQUEST - len(all_list)
         if missing > 0:
             zero_vec = [0.0] * cfg.REQUEST_INPUT_DIM
             all_list.extend([zero_vec] * missing)
 
+        assert len(all_list) == cfg.MAX_NUM_REQUEST, "MAX_NUM_REQUEST mismatch"
         self.request_state = np.array(all_list, dtype=np.float32)
         # print(self.request_state)
         # print(self.request_state.shape)
         # print(self.request_state.dtype)
 
+        # Relation State 생성
         all_list = []
         for v in self.vehicle_list:
             v_list = []
-            for r in self.request_list:
+            for idx, r in enumerate(self.active_request_list):
+                if idx >= cfg.MAX_NUM_REQUEST:
+                    break
                 need_drop_off = 0
-                if r in v.active_requests:
+                if r in v.active_request_list:
                     need_drop_off = 1
 
                 if r.status == RequestStatus.PENDING:
@@ -134,7 +194,7 @@ class RideSharingEnvironment:
                 vec = [need_drop_off, dur]
                 v_list.append(vec)
 
-            missing = cfg.NUM_REQUEST - len(v_list)
+            missing = cfg.MAX_NUM_REQUEST - len(v_list)
             if missing > 0:
                 zero_vec = [0.0] * cfg.RELATION_INPUT_DIM
                 v_list.extend([zero_vec] * missing)
@@ -169,8 +229,14 @@ class RideSharingEnvironment:
                 continue
 
             v_row = []
-            # 현재 차량이 Idle, 현재 request가 Dummy가 아닐 경우
-            for r in self.request_list:
+            # 현재 차량이 Idle할때
+            for idx, r in enumerate(self.active_request_list):
+                # 현재 request가 Dummy가 아닐 경우,
+
+                # 가능한 액션 개수를 넘는 초과 요청은 상태로 다루지 않아, 마스킹 대상이 아님
+                if idx >= cfg.MAX_NUM_REQUEST:
+                    break
+
                 # 현재 request가 이미 해당 차량에 assigned된 경우, 즉 drop off 대상
                 if r.status == RequestStatus.PICKEDUP:
                     if r.assigned_v_id == v.id:
@@ -186,7 +252,7 @@ class RideSharingEnvironment:
                     v_row.append(0)
 
             # 현재 request가 Dummy 일 경우
-            missing = cfg.NUM_REQUEST - len(self.request_list)
+            missing = cfg.MAX_NUM_REQUEST - len(self.active_request_list)
             if missing > 0:
                 v_row.extend([0] * missing)
 
@@ -203,6 +269,8 @@ class RideSharingEnvironment:
         action_idx = action[1]
         v = self.vehicle_list[vehicle_idx]
 
+        assert action_idx < cfg.POSSIBLE_ACTION, "Invalid action"
+
         curr_reward = 0
         done = False
 
@@ -212,11 +280,11 @@ class RideSharingEnvironment:
         else:
             # Matching
             # 어떤 요청이 채택된 경우 - Pickup 하러 가거나 Dropoff 하러 가야 함
-            r = self.request_list[action_idx]
-            if r not in v.active_requests:
+            r = self.active_request_list[action_idx]
+            if r not in v.active_request_list:
                 # Pickup 하러 가야하는 경우
                 v.status = VehicleStatus.PICKUP
-                v.active_requests.append(r)
+                v.active_request_list.append(r)
                 v.next_node = r.from_node_id
                 v.target_request = r
                 v.target_arrival_time = self.curr_time + self.network.get_duration(v.curr_node, v.next_node)
@@ -225,12 +293,41 @@ class RideSharingEnvironment:
                 r.assigned_v_id = v.id
 
                 curr_reward += 1
+
+                # 만약 Pickup이 즉시 완료된다면
+                if v.curr_node == v.next_node:
+                    v.status = VehicleStatus.IDLE
+                    v.next_node = 0
+                    v.target_request = None
+                    v.target_arrival_time = -1
+
+                    r.status = RequestStatus.PICKEDUP
+                    r.waiting_time = self.curr_time - r.request_time  # 마지막 확정 업데이트
+                    r.pickup_at = self.curr_time  # 마지막 확정 업데이트
+
+                    # TODO: 추후 픽업 리워드 필요하면 넣기
             else:
                 # Dropoff 하러 가야하는 경우
                 v.status = VehicleStatus.DROPOFF
                 v.next_node = r.to_node_id
                 v.target_request = r
                 v.target_arrival_time = self.curr_time + self.network.get_duration(v.curr_node, v.next_node)
+
+                # 만약 Dropoff가 즉시 완료된다면
+                if v.curr_node == v.next_node:
+                    v.status = VehicleStatus.IDLE
+                    v.next_node = 0
+                    v.target_request = None
+                    v.target_arrival_time = -1
+
+                    r.status = RequestStatus.FINISHED
+                    r.arrival_due_left = r.arrival_due - self.curr_time     # 마지막 확정 업데이트
+                    r.in_vehicle_time = self.curr_time - r.pickup_at      # 마지막 확정 업데이트
+                    r.dropoff_at = self.curr_time                         # 마지막 확정 업데이트
+                    self.active_request_list.remove(r)
+                    self.done_request_list.append(r)
+
+
 
         self.sync_state()
         self.curr_step += 1

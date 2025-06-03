@@ -33,9 +33,8 @@ class DQNAgent:
         self.epsilon = 1.0
         self.epsilon_min = 0.1
         self.epsilon_decay = 0.995
-        self.epsilon_delta = (self.epsilon - self.epsilon_min) / max_episodes
-        self.batch_size = 32
 
+        self.batch_size = 32
         self.memory = deque(maxlen=20000)
 
         # self.update_target_model()
@@ -59,9 +58,9 @@ class DQNAgent:
             print(f"No model weights loaded at{file_path}")
 
     def build_model(self):
-        vehicle_input = Input(shape=(cfg.NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")  # (B, V, Dv)
-        request_input = Input(shape=(cfg.NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")  # (B, R, Dr)
-        relation_input = Input(shape=(cfg.NUM_VEHICLES, cfg.NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input") # (B, V, R, Drel)
+        vehicle_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")  # (B, V, Dv)
+        request_input = Input(shape=(cfg.MAX_NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")  # (B, R, Dr)
+        relation_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input") # (B, V, R, Drel)
 
         v_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(vehicle_input)  # (B, V, H)
         r_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(request_input)  # (B, R, H)
@@ -69,8 +68,8 @@ class DQNAgent:
         v_expand = tf.expand_dims(v_embed, axis=2)  # (B, V, 1, H)
         r_expand = tf.expand_dims(r_embed, axis=1)  # (B, 1, R, H)
 
-        v_tiled = tf.tile(v_expand, [1, 1, cfg.NUM_REQUEST, 1])  # (B, V, R, H)
-        r_tiled = tf.tile(r_expand, [1, cfg.NUM_VEHICLES, 1, 1])  # (B, V, R, H)
+        v_tiled = tf.tile(v_expand, [1, 1, cfg.MAX_NUM_REQUEST, 1])  # (B, V, R, H)
+        r_tiled = tf.tile(r_expand, [1, cfg.MAX_NUM_VEHICLES, 1, 1])  # (B, V, R, H)
 
         # Broadcast concat to shape (B, V, R, 2H + Drel)
         pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled, relation_input])  # (B, V, R, 2H + Drel)
@@ -80,7 +79,7 @@ class DQNAgent:
         q_match = Lambda(lambda x: tf.squeeze(x, axis=-1))(q_match)  # (B, V, R)
 
         r_summary = tf.reduce_mean(r_embed, axis=1)  # (B, H)
-        r_summary = RepeatVector(cfg.NUM_VEHICLES)(r_summary)  # (B, V, H)
+        r_summary = RepeatVector(cfg.MAX_NUM_VEHICLES)(r_summary)  # (B, V, H)
         reject_context = Concatenate(axis=-1)([v_embed, r_summary])  # (B, V, 2H)
 
         q_reject = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(reject_context)

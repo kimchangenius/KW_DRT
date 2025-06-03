@@ -103,7 +103,8 @@ def main():
             env.sync_state()
             state = env.state
 
-            if env.curr_time == 3:
+            if env.curr_time == 70:
+                env.print_logs()
                 return
 
             # while any(v.status == 'idle' for v in env.vehicle_list):
@@ -164,7 +165,7 @@ def main():
         #     agent.epsilon = max(agent.epsilon_min,
         #                         1.0 - (ep - 100) * (1.0 - agent.epsilon_min) / (episodes - 100))
 
-        waiting_end = sum(1 for p in env.passengers if p.pickup_time is None)
+        waiting_end = sum(1 for p in env.passengers if p.pickup_at is None)
         episode_logs.append({
             "Episode": ep + 1,
             "Total Reward": total_reward,
