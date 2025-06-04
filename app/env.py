@@ -303,7 +303,7 @@ class RideSharingEnvironment:
 
         assert action_idx < cfg.POSSIBLE_ACTION, "Invalid action"
 
-        curr_reward = 0
+        reward = 0
         done = False
 
         if action_idx == cfg.POSSIBLE_ACTION - 1:
@@ -319,12 +319,15 @@ class RideSharingEnvironment:
                 v.active_request_list.append(r)
                 v.next_node = r.from_node_id
                 v.target_request = r
-                v.target_arrival_time = self.curr_time + self.network.get_duration(v.curr_node, v.next_node)
+                pickup_duration = self.network.get_duration(v.curr_node, v.next_node)
+                v.target_arrival_time = self.curr_time + pickup_duration
 
                 r.status = RequestStatus.ACCEPTED
                 r.assigned_v_id = v.id
 
-                curr_reward += 1
+                # Pickup 결정 리워드 (최대 1점, 즉시 보상)
+                reward = 0.5 * (1 - pickup_duration / self.network.max_duration)
+                + 0.5 * (1 - r.waiting_time / cfg.MAX_WAIT_TIME)
 
                 # 만약 Pickup이 즉시 완료된다면
                 if v.curr_node == v.next_node:
@@ -338,14 +341,22 @@ class RideSharingEnvironment:
                     r.status = RequestStatus.PICKEDUP
                     r.waiting_time = self.curr_time - r.request_time  # 마지막 확정 업데이트
                     r.pickup_at = self.curr_time  # 마지막 확정 업데이트
+                    # Pickup 완료 보상은 따로 없음
 
-                    # TODO: 추후 픽업 리워드 필요하면 넣기
             else:
                 # Dropoff 하러 가야하는 경우
                 v.status = VehicleStatus.DROPOFF
                 v.next_node = r.to_node_id
                 v.target_request = r
-                v.target_arrival_time = self.curr_time + self.network.get_duration(v.curr_node, v.next_node)
+                dropoff_duration = self.network.get_duration(v.curr_node, v.next_node)
+                v.target_arrival_time = self.curr_time + dropoff_duration
+
+                # Dropoff 결정 리워드 (즉시 보상)
+                in_vehicle_ratio = r.in_vehicle_time / cfg.MAX_INVEHICLE_TIME
+                if in_vehicle_ratio > 1:
+                    in_vehicle_ratio = 1
+                reward = 0.5 * (1 - dropoff_duration / self.network.max_duration)
+                + 0.5 * (1 - in_vehicle_ratio)
 
                 # 만약 Dropoff가 즉시 완료된다면
                 if v.curr_node == v.next_node:
@@ -364,11 +375,13 @@ class RideSharingEnvironment:
                     self.active_request_list.remove(r)
                     self.done_request_list.append(r)
 
+                    # TODO: 요청 완료 리워드 구현 (지연 보상)
+
 
         self.sync_state()
         self.curr_step += 1
 
-        return self.state, curr_reward, done
+        return self.state, reward, done
 
     def has_idle_vehicle(self):
         has = False

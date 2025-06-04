@@ -65,12 +65,13 @@ def main():
 
     for ep in range(episodes):
         # step_logs = []
-        # total_reward = 0.0
         # total_loss = 0.0
         # prev_dropped = 0
 
         done = False
         time_updated = False
+
+        total_reward = 0.0
 
         state = env.reset()
         # print(state[0].shape)
@@ -89,8 +90,9 @@ def main():
                 action = agent.act(state, action_mask)
                 next_state, reward, done = env.step(action)
 
+                total_reward += reward
                 # print(next_state.shape)
-                print(reward)
+                print('Curr Reward: {}'.format(reward))
                 env.print_vehicles()
                 env.print_active_requests()
 
@@ -102,6 +104,7 @@ def main():
             if env.is_done():
                 env.print_statistics()
                 env.print_vehicles()
+                print('Total Reward: {}'.format(total_reward))
                 break
 
             env.sync_state()
