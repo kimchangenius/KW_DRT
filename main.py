@@ -52,10 +52,7 @@ def main():
     print("Data Load & Network Setup Complete")
 
     agent = DQNAgent(hidden_dim=128)
-    agent.load_model(DQN_WEIGHT_PATH)
-
-    episode_logs = []
-    episodes = 1
+    # agent.load_model(DQN_WEIGHT_PATH)
 
     env = RideSharingEnvironment(
         network=network,
@@ -63,21 +60,15 @@ def main():
         vehicle_init_pos=vehicle_positions
     )
 
+    episodes = 1
+    update_freq = 10
+    final_train_steps = 5
     for ep in range(episodes):
-        # step_logs = []
-        # total_loss = 0.0
-        # prev_dropped = 0
-
-        done = False
-        time_updated = False
-
+        total_loss = 0.0
         total_reward = 0.0
-
         state = env.reset()
-        # print(state[0].shape)
-        # print(state[1].shape)
-        # print(state[2].shape)
 
+        delayed_reward_confirm = 0
         while True:
             print('\n============ Time : {} ============'.format(env.curr_time))
             env.print_vehicles()
@@ -86,25 +77,56 @@ def main():
             while env.has_idle_vehicle():
                 print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
                 action_mask = env.get_action_mask()
-                print(action_mask)
+                # print(action_mask)
                 action = agent.act(state, action_mask)
-                next_state, reward, done = env.step(action)
+                env.enrich_action(action)
+                next_state, reward, info = env.step(action)
 
-                total_reward += reward
-                # print(next_state.shape)
                 print('Curr Reward: {}'.format(reward))
                 env.print_vehicles()
                 env.print_active_requests()
 
+                transition = [state, action, reward, next_state, False]
+                if info['is_pending'] is True:
+                    agent.pending(transition)
+                else:
+                    agent.remember(transition)
+
+                if info['has_delayed_reward'] is True:
+                    for action_id in info['action_id_list']:
+                        d_reward = info['reward']
+                        agent.confirm_and_remember(action_id, d_reward)
+                        delayed_reward_confirm += 1
+
+                if env.curr_step % update_freq == 0:
+                    agent.train()
+
+                total_reward += reward
                 state = next_state
 
             env.curr_time += 1
-            env.handle_time_update()
+            d_reward_list = env.handle_time_update()
+
+            for pair in d_reward_list:
+                agent.confirm_and_remember(pair[0], pair[1])
+                delayed_reward_confirm += 1
 
             if env.is_done():
+                # 마지막 transition의 done을 True로 변경
+                last_transition = agent.replay_buffer.get_last()
+                if last_transition is not None:
+                    last_transition[4] = True
+
+                for _ in range(final_train_steps):
+                    agent.train()
+
+                assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
+
                 env.print_statistics()
-                env.print_vehicles()
                 print('Total Reward: {}'.format(total_reward))
+                print('Num Transitions: {}'.format(len(agent.replay_buffer)))
+                print('Num Delayed Reward: {}'.format(delayed_reward_confirm))
+                # env.print_vehicles()
                 break
 
             env.sync_state()
@@ -137,61 +159,6 @@ def main():
             # done = (env.curr_time >= 60)
             # if done:
             #     break
-
-        return
-        agent.decay_epsilon(ep, episodes)
-
-            # dropped_this_step = env.dropped_passengers - prev_dropped
-            # prev_dropped = env.dropped_passengers
-            #
-            # waiting = sum(1 for p in env.passengers if p.pickup_time is None)
-            #
-            # matched = len(env.matched_ids)
-            # canceled = len(env.canceled_ids)
-            # total_accounted = matched + canceled + waiting
-            #
-            # step_logs.append({
-            #     "Step": t + 1,
-            #     "Total Reward": total_reward,
-            #     "Loss": loss,
-            #     "Matched Passengers": matched,
-            #     "Canceled": canceled,
-            #     "Dropped Passengers": dropped_this_step,
-            #     "Waiting Passengers": waiting,
-            #     "Total Accounted Passengers": total_accounted,
-            #     "Rebalancing Count": env.rebalancing_count
-            # })
-
-
-        # if ep < 100:
-        #     agent.epsilon = 1.0
-        # else:
-        #     agent.epsilon = max(agent.epsilon_min,
-        #                         1.0 - (ep - 100) * (1.0 - agent.epsilon_min) / (episodes - 100))
-
-        waiting_end = sum(1 for p in env.passengers if p.pickup_at is None)
-        episode_logs.append({
-            "Episode": ep + 1,
-            "Total Reward": total_reward,
-            "Loss": total_loss,
-            "Matched Passengers": len(env.matched_ids),
-            "Canceled": len(env.canceled_ids),
-            "Dropped Passengers": env.dropped_passengers,
-            "Waiting Passengers": waiting_end,
-            "Total Accounted Passengers": len(env.matched_ids) + len(env.canceled_ids) + waiting_end,
-            "Rebalancing Count": env.rebalancing_count
-        })
-
-        print(f"Episode: {ep + 1}  Total Reward: {total_reward:.2f}  Total Loss: {total_loss:.4f}")
-        step_df = pd.DataFrame(step_logs)
-        step_df.to_csv(os.path.join(EPISODES_PATH, f"{ep + 1} episode result.csv"), index=False)
-        if ep == episodes - 1:
-            final_model_path = os.path.join(RESULT_PATH, f"dqn_model_weights_final.weight.h5")
-            agent.save_model(final_model_path)
-
-    df = pd.DataFrame(episode_logs)
-    df.to_csv(os.path.join(RESULT_PATH, "results.csv"), index=False)
-    print("DQN training completed.")
 
 
 if __name__ == "__main__":

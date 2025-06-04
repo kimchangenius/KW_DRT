@@ -2,6 +2,7 @@ from enum import IntEnum
 
 REQUEST_STATUS_NUM_CLASSES = 3
 
+
 class RequestStatus(IntEnum):
     PENDING = 1     # 어떤 차량도 수락하지 않은 상태
     ACCEPTED = 2    # 차량 한 대에 의해 수락된 사태

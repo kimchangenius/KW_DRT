@@ -1,44 +1,34 @@
 import os
-import random
 import numpy as np
 import tensorflow as tf
 import app.config as cfg
 
-from collections import deque
-from app.action_type import ActionType
+from app.pending_buffer import PendingBuffer
+from app.replay_buffer import ReplayBuffer
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, TimeDistributed, Lambda, Concatenate, RepeatVector, Reshape
 from tensorflow.python.distribute.combinations import tf_function
 
 
 class DQNAgent:
-    def __init__(self, hidden_dim, max_episodes=500):
+    def __init__(self, hidden_dim, batch_size=32):
         self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
+
         self.model = self.build_model()
         self.target_model = self.build_model()
-
-        self.num_reject = 1
-        self.num_matching = 20
-        self.num_rebalancing = 3
-        self.param_dim_matching = 1
-        self.param_dim_rebalancing = 1
-
-        self.total_actions = (
-            self.num_reject +
-            self.num_matching +
-            self.num_rebalancing
-        )
 
         self.gamma = 0.99
         self.epsilon = 1.0
         self.epsilon_min = 0.1
         self.epsilon_decay = 0.995
 
-        self.batch_size = 32
-        self.memory = deque(maxlen=20000)
+        self.replay_buffer = ReplayBuffer()
+        self.pending_buffer = PendingBuffer()
 
+        # self.memory = deque(maxlen=20000)
         # self.update_target_model()
-        #  self.target_update_counter = 0
+        # self.target_update_counter = 0
         # self.train_counter = 0
         # self.target_update_freq = 1000
 
@@ -91,84 +81,106 @@ class DQNAgent:
         return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_total)
 
     def act(self, state, action_mask):
+        info = {
+            'mode': None
+        }
         if np.random.rand() < self.epsilon:
+            info['mode'] = 'explore'
             valid_actions = tf.where(action_mask == 1)
             rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
             rand_action = valid_actions[rand_idx]
             rand_action = rand_action.numpy()
-            return [int(rand_action[0]), int(rand_action[1]), 'explore']
+            vehicle_idx = int(rand_action[0])
+            action_idx = int(rand_action[1])
         else:
+            info['mode'] = 'exploit'
             q_values = self.model.predict(state)
             masked_q = tf.where(action_mask == 1, q_values, tf.float32.min)
             flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
             vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
             action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
-            return [vehicle_idx, action_idx, 'exploit']
+        return [vehicle_idx, action_idx, info]
 
-    @tf_function
-    def predict_q_all(self, states: tf.Tensor) -> tf.Tensor:
-        return self.model(states, training=False)
+    def remember(self, transition):
+        self.replay_buffer.append(transition)
 
-    @tf_function
-    def predict_target_q_all(self, states: tf.Tensor) -> tf.Tensor:
-        return self.target_model(states, training=False)
+    def pending(self, transition):
+        action = transition[1]
+        action_id = action[2]['id']
+        self.pending_buffer.add(action_id, transition)
 
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
+    def confirm_and_remember(self, action_id, reward):
+        transition = self.pending_buffer.confirm(action_id, reward)
+        if transition is not None:
+            self.remember(transition)
 
-    def replay(self):
-        self.train_counter += 1
-        # 매 5스텝마다, 메모리가 충분할 때만 학습
-        if self.train_counter % 5 != 0 or len(self.memory) < self.batch_size:
+    def train(self):
+        if len(self.replay_buffer) < self.batch_size:
             return
+        # TODO
+        return
 
-        batch = random.sample(self.memory, self.batch_size)
-        losses = []
+    # @tf_function
+    # def predict_q_all(self, states: tf.Tensor) -> tf.Tensor:
+    #     return self.model(states, training=False)
 
-        for state, action_list, reward, next_state, done in batch:
-            # 0) 텐서 준비 (batch size=1)
-            st_t = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
-            nxt_t = tf.convert_to_tensor(next_state.reshape(1, -1), dtype=tf.float32)
+    # @tf_function
+    # def predict_target_q_all(self, states: tf.Tensor) -> tf.Tensor:
+    #     return self.target_model(states, training=False)
 
-            # 1) online 네트워크로부터 next Q 선택용
-            q_next_on = self.predict_q_all(nxt_t).numpy().reshape(-1)  # shape=(A,)
-            a_max = int(np.argmax(q_next_on))
+    # def replay(self):
+    #     self.train_counter += 1
+    #     # 매 5스텝마다, 메모리가 충분할 때만 학습
+    #     if self.train_counter % 5 != 0 or len(self.memory) < self.batch_size:
+    #         return
+    #
+    #     batch = random.sample(self.memory, self.batch_size)
+    #     losses = []
+    #
+    #     for state, action_list, reward, next_state, done in batch:
+    #         # 0) 텐서 준비 (batch size=1)
+    #         st_t = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
+    #         nxt_t = tf.convert_to_tensor(next_state.reshape(1, -1), dtype=tf.float32)
+    #
+    #         # 1) online 네트워크로부터 next Q 선택용
+    #         q_next_on = self.predict_q_all(nxt_t).numpy().reshape(-1)  # shape=(A,)
+    #         a_max = int(np.argmax(q_next_on))
+    #
+    #         # 2) target 네트워크로부터 next Q 평가용
+    #         q_next_tg = self.predict_target_q_all(nxt_t).numpy().reshape(-1)
+    #         max_q_next = float(q_next_tg[a_max])
+    #
+    #         # 3) 벨만 타깃값
+    #         target_q_value = reward if done else reward + self.gamma * max_q_next
+    #
+    #         # 4) 현재 상태에서 Q값
+    #         q_current = self.predict_q_all(st_t).numpy().reshape(-1)
+    #
+    #         # 5) 실제 취한 action index로 Q 업데이트
+    #         for act in action_list:
+    #             if act['action_type'] == ActionType.REJECT:
+    #                 idx = 0
+    #             elif act['action_type'] == ActionType.MATCHING:
+    #                 idx = act['discrete_index'] + self.num_reject
+    #             else:  # REBALANCING
+    #                 idx = act['discrete_index'] + self.num_reject + self.num_matching
+    #             q_current[idx] = target_q_value
+    #
+    #         loss = self.model.train_on_batch(
+    #             st_t,
+    #             q_current[np.newaxis, :]  # shape=(1, A)
+    #         )
+    #         losses.append(loss)
+    #
+    #     self.target_update_counter += 1
+    #     if self.target_update_counter % self.target_update_freq == 0:
+    #         self.update_target_model()
+    #
+    #     return float(np.mean(losses))
 
-            # 2) target 네트워크로부터 next Q 평가용
-            q_next_tg = self.predict_target_q_all(nxt_t).numpy().reshape(-1)
-            max_q_next = float(q_next_tg[a_max])
-
-            # 3) 벨만 타깃값
-            target_q_value = reward if done else reward + self.gamma * max_q_next
-
-            # 4) 현재 상태에서 Q값
-            q_current = self.predict_q_all(st_t).numpy().reshape(-1)
-
-            # 5) 실제 취한 action index로 Q 업데이트
-            for act in action_list:
-                if act['action_type'] == ActionType.REJECT:
-                    idx = 0
-                elif act['action_type'] == ActionType.MATCHING:
-                    idx = act['discrete_index'] + self.num_reject
-                else:  # REBALANCING
-                    idx = act['discrete_index'] + self.num_reject + self.num_matching
-                q_current[idx] = target_q_value
-
-            loss = self.model.train_on_batch(
-                st_t,
-                q_current[np.newaxis, :]  # shape=(1, A)
-            )
-            losses.append(loss)
-
-        self.target_update_counter += 1
-        if self.target_update_counter % self.target_update_freq == 0:
-            self.update_target_model()
-
-        return float(np.mean(losses))
-
-    def decay_epsilon(self, ep, episodes):
-        if ep < 100:
-            self.epsilon = 1.0
-        else:
-            self.epsilon = max(self.epsilon_min,
-                               1.0 - (ep - 100) * (1.0 - self.epsilon_min) / (episodes - 100))
+    # def decay_epsilon(self, ep, episodes):
+    #     if ep < 100:
+    #         self.epsilon = 1.0
+    #     else:
+    #         self.epsilon = max(self.epsilon_min,
+    #                            1.0 - (ep - 100) * (1.0 - self.epsilon_min) / (episodes - 100))

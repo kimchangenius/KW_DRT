@@ -5,12 +5,14 @@ class PendingBuffer:
     def add(self, action_id, transition):
         self.pending[action_id] = transition
 
-    def confirm(self, action_id, reward, next_state):
-        # 보상이 확정되면 replay buffer로 넘김
-        # transition = self.pending.pop(action_id)
-        # full_transition = (transition.state, transition.action, reward, next_state, done)
-        # return full_transition
-        return None
+    def confirm(self, action_id, reward):
+        transition = self.pending.pop(action_id, None)
+        if transition is not None:
+            transition[2] += reward
+        return transition
 
     def cancel(self, action_id):
         self.pending.pop(action_id, None)  # 또는 보상 -1 부여
+
+    def __len__(self):
+        return len(self.pending)

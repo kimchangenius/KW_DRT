@@ -6,6 +6,7 @@ from pprint import pprint
 from app.request_status import RequestStatus
 from app.vehicle import Vehicle
 from app.vehicle_status import VehicleStatus
+from app.action_type import ActionType
 
 
 class RideSharingEnvironment:
@@ -93,7 +94,7 @@ class RideSharingEnvironment:
 
     # 시간이 업데이트 될 때 필요한 모든 것들을 업데이트 함
     def handle_time_update(self):
-        # TODO: 여기서 발생한 reward를 적절히 과거 리플레이에 분배해주어야 함
+        d_reward_list = []
 
         # 현재 시간에 들어올 새로운 요청을 추가
         while self.future_request_list and self.future_request_list[0].request_time <= self.curr_time:
@@ -119,8 +120,14 @@ class RideSharingEnvironment:
                     v.target_arrival_time = -1
 
                     if r.status == RequestStatus.CANCELLED:
+                        # Pickup 실패
                         v.active_request_list.remove(r)
+
+                        # Cancel 페널티 (Pickup 결정, 지연 보상(페널티))
+                        p_action_id = "{}_1".format(r.id)
+                        d_reward_list.append([p_action_id, -1])
                     else:
+                        # Pickup 성공
                         v.num_passengers += r.num_passengers
                         assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
@@ -152,6 +159,12 @@ class RideSharingEnvironment:
                     self.active_request_list.remove(r)
                     self.done_request_list.append(r)
 
+                    # Request 완료 보상 (Pickup and Dropoff, 지연 보상)
+                    p_action_id = "{}_1".format(r.id)
+                    d_action_id = "{}_2".format(r.id)
+                    d_reward_list.append([p_action_id, 0.5])
+                    d_reward_list.append([d_action_id, 0.5])
+
         # Request 업데이트
         cancelled_list = []
         for r in self.active_request_list:
@@ -172,6 +185,8 @@ class RideSharingEnvironment:
 
         for idx, r in enumerate(self.active_request_list):
             r.slot_idx = idx
+
+        return d_reward_list
 
 
     # 기존에 가진 자료구조들을 토대로 state 형태로 만들어주기만 하는 역할
@@ -294,17 +309,36 @@ class RideSharingEnvironment:
             all_list.append(v_row)
         return np.array(all_list, dtype=np.float32)
 
-    # next_state, reward, done 을 기본적으로 리턴
-    def step(self, action):
-        print('Env: current action : {}'.format(action))
+    def enrich_action(self, action):
         vehicle_idx = action[0]
         action_idx = action[1]
         v = self.vehicle_list[vehicle_idx]
+        if action_idx == cfg.POSSIBLE_ACTION - 1:
+            action[2]['r_id'] = ""
+            action[2]['type'] = ActionType.REJECT
+        else:
+            r = self.active_request_list[action_idx]
+            action[2]['r_id'] = r.id
+            if r not in v.active_request_list:
+                action[2]['type'] = ActionType.PICKUP
+            else:
+                action[2]['type'] = ActionType.DROPOFF
+        action[2]['id'] = "{}_{}".format(action[2]['r_id'], action[2]['type'].value)
 
+    def step(self, action):
+        print('Env: Curr action : {}'.format(action))
+        vehicle_idx = action[0]
+        action_idx = action[1]
         assert action_idx < cfg.POSSIBLE_ACTION, "Invalid action"
 
         reward = 0
-        done = False
+        info = {
+            'is_pending': False,
+            'has_delayed_reward': False,
+            'action_id_list': None,
+            'reward': None
+        }
+        v = self.vehicle_list[vehicle_idx]
 
         if action_idx == cfg.POSSIBLE_ACTION - 1:
             # Reject
@@ -313,8 +347,10 @@ class RideSharingEnvironment:
             # Matching
             # 어떤 요청이 채택된 경우 - Pickup 하러 가거나 Dropoff 하러 가야 함
             r = self.active_request_list[action_idx]
+
             if r not in v.active_request_list:
                 # Pickup 하러 가야하는 경우
+                info['is_pending'] = True
                 v.status = VehicleStatus.PICKUP
                 v.active_request_list.append(r)
                 v.next_node = r.from_node_id
@@ -325,7 +361,7 @@ class RideSharingEnvironment:
                 r.status = RequestStatus.ACCEPTED
                 r.assigned_v_id = v.id
 
-                # Pickup 결정 리워드 (최대 1점, 즉시 보상)
+                # Pickup 결정 보상 (최대 1점, 즉시 보상)
                 reward = 0.5 * (1 - pickup_duration / self.network.max_duration)
                 + 0.5 * (1 - r.waiting_time / cfg.MAX_WAIT_TIME)
 
@@ -341,10 +377,12 @@ class RideSharingEnvironment:
                     r.status = RequestStatus.PICKEDUP
                     r.waiting_time = self.curr_time - r.request_time  # 마지막 확정 업데이트
                     r.pickup_at = self.curr_time  # 마지막 확정 업데이트
-                    # Pickup 완료 보상은 따로 없음
 
+                    # Pickup 결정 즉시 완료 보상
+                    reward += 1
             else:
                 # Dropoff 하러 가야하는 경우
+                info['is_pending'] = True
                 v.status = VehicleStatus.DROPOFF
                 v.next_node = r.to_node_id
                 v.target_request = r
@@ -375,13 +413,23 @@ class RideSharingEnvironment:
                     self.active_request_list.remove(r)
                     self.done_request_list.append(r)
 
-                    # TODO: 요청 완료 리워드 구현 (지연 보상)
+                    # Dropoff 결정 즉시 완료 보상
+                    reward += 1
 
+                    # Request 완료 보상 (Dropoff, 즉시 보상)
+                    reward += 0.5
+                    info['is_pending'] = False
+
+                    # Request 완료 보상 (Pickup, 지연 보상)
+                    info['has_delayed_reward'] = True
+                    action_id = "{}_1".format(r.id)
+                    info['action_id_list'] = [action_id]
+                    info['reward'] = 0.5
 
         self.sync_state()
         self.curr_step += 1
 
-        return self.state, reward, done
+        return self.state, reward, info
 
     def has_idle_vehicle(self):
         has = False

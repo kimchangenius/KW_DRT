@@ -13,6 +13,11 @@ class ReplayBuffer:
     def sample(self, batch_size):
         return None
 
+    def get_last(self):
+        if len(self.buffer) == 0:
+            return None
+        return self.buffer[(self.position - 1) % len(self.buffer)]
+
     def __len__(self):
         return len(self.buffer)
     

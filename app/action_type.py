@@ -3,4 +3,8 @@ import enum
 
 class ActionType(enum.Enum):
     REJECT = 0
-    MATCHING = 1
+    PICKUP = 1
+    DROPOFF = 2
+
+    def __str__(self):
+        return self.name
