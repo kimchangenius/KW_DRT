@@ -60,33 +60,47 @@ def main():
         vehicle_init_pos=vehicle_positions
     )
 
-    episodes = 1
+    total_rewards = []
+    total_losses = []
+
+    episodes = 500
     update_freq = 10
     final_train_steps = 5
+    transition_id = 0
     for ep in range(episodes):
+        # print('\n============ Ep : {} ============'.format(ep))
         total_loss = 0.0
         total_reward = 0.0
         state = env.reset()
 
         delayed_reward_confirm = 0
         while True:
-            print('\n============ Time : {} ============'.format(env.curr_time))
-            env.print_vehicles()
-            env.print_active_requests()
+            # print('\n============ Time : {} ============'.format(env.curr_time))
+            # env.print_vehicles()
+            # env.print_active_requests()
 
             while env.has_idle_vehicle():
-                print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
+                # print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
+
                 action_mask = env.get_action_mask()
-                # print(action_mask)
                 action = agent.act(state, action_mask)
                 env.enrich_action(action)
+
                 next_state, reward, info = env.step(action)
+                next_action_mask = env.get_action_mask()
 
-                print('Curr Reward: {}'.format(reward))
-                env.print_vehicles()
-                env.print_active_requests()
+                # print('Curr Reward: {}'.format(reward))
+                # env.print_vehicles()
+                # env.print_active_requests()
 
-                transition = [state, action, reward, next_state, False]
+                t_info = {
+                    'id': transition_id,
+                    'm': action_mask,
+                    'nm': next_action_mask,
+                }
+
+                transition = [state, action, reward, next_state, False, t_info]
+                transition_id += 1
                 if info['is_pending'] is True:
                     agent.pending(transition)
                 else:
@@ -99,7 +113,9 @@ def main():
                         delayed_reward_confirm += 1
 
                 if env.curr_step % update_freq == 0:
-                    agent.train()
+                    curr_loss = agent.train()
+                    if curr_loss is not None:
+                        total_loss += curr_loss
 
                 total_reward += reward
                 state = next_state
@@ -118,47 +134,30 @@ def main():
                     last_transition[4] = True
 
                 for _ in range(final_train_steps):
-                    agent.train()
+                    curr_loss = agent.train()
+                    if curr_loss is not None:
+                        total_loss += curr_loss
 
                 assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
 
-                env.print_statistics()
-                print('Total Reward: {}'.format(total_reward))
-                print('Num Transitions: {}'.format(len(agent.replay_buffer)))
-                print('Num Delayed Reward: {}'.format(delayed_reward_confirm))
+                # env.print_statistics()
+                # print('Total Reward: {}'.format(total_reward))
+                # print('Total Loss: {}'.format(total_loss))
+                print('====== Ep: {} / Reward: {} / Loss: {} / eps: {} ======'.format(ep, total_reward, total_loss, agent.epsilon))
+                total_rewards.append(total_reward)
+                total_losses.append(total_loss)
+                # print('Num Transitions: {}'.format(len(agent.replay_buffer)))
+                # print('Num Delayed Reward: {}'.format(delayed_reward_confirm))
                 # env.print_vehicles()
                 break
 
             env.sync_state()
             state = env.state
 
-            # while any(v.status == 'idle' for v in env.vehicle_list):
-            #     batch_states = np.tile(st, (NUM_VEHICLES, 1))
-            #     veh_i, act = agent.act(batch_states, env.vehicle_list)
-            #
-            #     pprint(act)
-            #     reward, next_state = env.step(veh_i, act)
-            #     total_reward += reward
-            #
-            #     pprint(next_state)
-            #     s = np.concatenate([batch_states[veh_i]])
-            #     s_next = env.flatten_state(next_state)
-            #     agent.remember(s.reshape(1, -1), [act], reward, s_next.reshape(1, -1), done)
-            #     loss = agent.replay()
-            #     if loss is None:
-            #         loss = 0.0
-            #     total_loss += loss
-            #
-            #     st = s_next
-            #
-            # env.curr_time += 1
-            #
-            # for v in env.vehicle_list:
-            #     env.status_map.get(v.status, 0)
-            #
-            # done = (env.curr_time >= 60)
-            # if done:
-            #     break
+        agent.decay_epsilon()
+
+    print(total_rewards)
+    print(total_losses)
 
 
 if __name__ == "__main__":

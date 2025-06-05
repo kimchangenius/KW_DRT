@@ -65,7 +65,7 @@ class RideSharingEnvironment:
     def print_statistics(self):
         num_served = 0
         num_cancelled = 0
-        print("\n====================== Statistics ======================")
+        print("====================== Statistics ======================")
         print('Request Done at Time : {}'.format(self.curr_time))
         print('Num Requests : {}'.format(len(self.done_request_list)))
         for r in self.done_request_list:
@@ -154,6 +154,8 @@ class RideSharingEnvironment:
                     # R 업데이트
                     r.status = RequestStatus.SERVED
                     r.arrival_due_left = r.arrival_due - self.curr_time     # 마지막 확정 업데이트
+                    if r.arrival_due_left < 0:
+                        r.arrival_due_left = 0
                     r.in_vehicle_time = self.curr_time - r.pickup_at         # 마지막 확정 업데이트
                     r.dropoff_at = self.curr_time                         # 마지막 확정 업데이트
                     self.active_request_list.remove(r)
@@ -169,6 +171,8 @@ class RideSharingEnvironment:
         cancelled_list = []
         for r in self.active_request_list:
             r.arrival_due_left = r.arrival_due - self.curr_time
+            if r.arrival_due_left < 0:
+                r.arrival_due_left = 0
             if r.status == RequestStatus.PENDING or r.status == RequestStatus.ACCEPTED:
                 r.waiting_time = self.curr_time - r.request_time
 
@@ -326,7 +330,7 @@ class RideSharingEnvironment:
         action[2]['id'] = "{}_{}".format(action[2]['r_id'], action[2]['type'].value)
 
     def step(self, action):
-        print('Env: Curr action : {}'.format(action))
+        # print('Env: Curr action : {}'.format(action))
         vehicle_idx = action[0]
         action_idx = action[1]
         assert action_idx < cfg.POSSIBLE_ACTION, "Invalid action"

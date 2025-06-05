@@ -7,7 +7,6 @@ from app.pending_buffer import PendingBuffer
 from app.replay_buffer import ReplayBuffer
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, TimeDistributed, Lambda, Concatenate, RepeatVector, Reshape
-from tensorflow.python.distribute.combinations import tf_function
 
 
 class DQNAgent:
@@ -17,23 +16,19 @@ class DQNAgent:
 
         self.model = self.build_model()
         self.target_model = self.build_model()
+        self.target_model.set_weights(self.model.get_weights())
+
+        self.train_step = 0
+        self.update_target_freq = 500
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
 
         self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_min = 0.1
+        self.epsilon_min = 0.05
         self.epsilon_decay = 0.995
 
         self.replay_buffer = ReplayBuffer()
         self.pending_buffer = PendingBuffer()
-
-        # self.memory = deque(maxlen=20000)
-        # self.update_target_model()
-        # self.target_update_counter = 0
-        # self.train_counter = 0
-        # self.target_update_freq = 1000
-
-    def update_target_model(self):
-        self.target_model.set_weights(self.model.get_weights())
 
     def save_model(self, file_path):
         self.model.save_weights(file_path)
@@ -42,7 +37,7 @@ class DQNAgent:
     def load_model(self, file_path):
         if os.path.exists(file_path):
             self.model.load_weights(file_path)
-            self.update_target_model()
+            self.target_model.set_weights(self.model.get_weights())
             print(f"Model weights loaded at {file_path}")
         else:
             print(f"No model weights loaded at{file_path}")
@@ -94,12 +89,18 @@ class DQNAgent:
             action_idx = int(rand_action[1])
         else:
             info['mode'] = 'exploit'
-            q_values = self.model.predict(state)
-            masked_q = tf.where(action_mask == 1, q_values, tf.float32.min)
+            q_values = self.model.predict(state, verbose=0)
+            masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e2, dtype=tf.float32))
             flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
             vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
             action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
         return [vehicle_idx, action_idx, info]
+
+    def decay_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+        # print(f"[Agent] Epsilon decayed to {self.epsilon:.4f}")
 
     def remember(self, transition):
         self.replay_buffer.append(transition)
@@ -116,71 +117,68 @@ class DQNAgent:
 
     def train(self):
         if len(self.replay_buffer) < self.batch_size:
-            return
-        # TODO
-        return
+            return None
 
-    # @tf_function
-    # def predict_q_all(self, states: tf.Tensor) -> tf.Tensor:
-    #     return self.model(states, training=False)
+        # print("\n\n================= Train : {} =================".format(self.train_step))
+        batch = self.replay_buffer.sample(self.batch_size)
 
-    # @tf_function
-    # def predict_target_q_all(self, states: tf.Tensor) -> tf.Tensor:
-    #     return self.target_model(states, training=False)
+        # === Q(s', a')  ===
+        next_vehicle_tensor = np.array([b[3][0][0] for b in batch])
+        next_request_tensor = np.array([b[3][1][0] for b in batch])
+        next_relation_tensor = np.array([b[3][2][0] for b in batch])
+        next_states = [next_vehicle_tensor, next_request_tensor, next_relation_tensor]
 
-    # def replay(self):
-    #     self.train_counter += 1
-    #     # 매 5스텝마다, 메모리가 충분할 때만 학습
-    #     if self.train_counter % 5 != 0 or len(self.memory) < self.batch_size:
-    #         return
-    #
-    #     batch = random.sample(self.memory, self.batch_size)
-    #     losses = []
-    #
-    #     for state, action_list, reward, next_state, done in batch:
-    #         # 0) 텐서 준비 (batch size=1)
-    #         st_t = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
-    #         nxt_t = tf.convert_to_tensor(next_state.reshape(1, -1), dtype=tf.float32)
-    #
-    #         # 1) online 네트워크로부터 next Q 선택용
-    #         q_next_on = self.predict_q_all(nxt_t).numpy().reshape(-1)  # shape=(A,)
-    #         a_max = int(np.argmax(q_next_on))
-    #
-    #         # 2) target 네트워크로부터 next Q 평가용
-    #         q_next_tg = self.predict_target_q_all(nxt_t).numpy().reshape(-1)
-    #         max_q_next = float(q_next_tg[a_max])
-    #
-    #         # 3) 벨만 타깃값
-    #         target_q_value = reward if done else reward + self.gamma * max_q_next
-    #
-    #         # 4) 현재 상태에서 Q값
-    #         q_current = self.predict_q_all(st_t).numpy().reshape(-1)
-    #
-    #         # 5) 실제 취한 action index로 Q 업데이트
-    #         for act in action_list:
-    #             if act['action_type'] == ActionType.REJECT:
-    #                 idx = 0
-    #             elif act['action_type'] == ActionType.MATCHING:
-    #                 idx = act['discrete_index'] + self.num_reject
-    #             else:  # REBALANCING
-    #                 idx = act['discrete_index'] + self.num_reject + self.num_matching
-    #             q_current[idx] = target_q_value
-    #
-    #         loss = self.model.train_on_batch(
-    #             st_t,
-    #             q_current[np.newaxis, :]  # shape=(1, A)
-    #         )
-    #         losses.append(loss)
-    #
-    #     self.target_update_counter += 1
-    #     if self.target_update_counter % self.target_update_freq == 0:
-    #         self.update_target_model()
-    #
-    #     return float(np.mean(losses))
+        next_q_values = self.target_model.predict(next_states, verbose=0)  # (B, V, A)
+        next_action_mask = np.array([b[5]['nm'] for b in batch])
+        masked_next_q_values = tf.where(next_action_mask == 1, next_q_values, tf.constant(-1e1, dtype=tf.float32))
+        max_next_q = np.max(masked_next_q_values, axis=(1, 2))
 
-    # def decay_epsilon(self, ep, episodes):
-    #     if ep < 100:
-    #         self.epsilon = 1.0
-    #     else:
-    #         self.epsilon = max(self.epsilon_min,
-    #                            1.0 - (ep - 100) * (1.0 - self.epsilon_min) / (episodes - 100))
+        rewards = np.array([b[2] for b in batch])
+        dones = np.array([b[4] for b in batch])
+        targets = rewards + self.gamma * max_next_q * (1 - dones)
+
+        # === Q(s, a)  ===
+        vehicle_tensor = np.array([b[0][0][0] for b in batch])  # (B, V, Dv)
+        request_tensor = np.array([b[0][1][0] for b in batch])  # (B, R, Dr)
+        relation_tensor = np.array([b[0][2][0] for b in batch])  # (B, V, R, Drel)
+        states = [vehicle_tensor, request_tensor, relation_tensor]
+
+        # for name, tensor in zip(
+        #         ["vehicle", "request", "relation"],
+        #         states
+        # ):
+        #     print(f"{name}_tensor has NaN:", np.isnan(tensor).any())
+        #     print(f"{name}_tensor min/max:", np.min(tensor), np.max(tensor))
+
+        with tf.GradientTape() as tape:
+            q_values = self.model(states, training=True)
+            # print(q_values)
+            action_mask = np.array([b[5]['m'] for b in batch])
+
+            masked_q_values = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
+            # print(masked_q_values)
+
+            actions_raw = np.array([b[1] for b in batch])  # (B, 3)
+            actions = actions_raw[:, :2]  # (B, 2)
+            indices = tf.constant(actions, dtype=tf.int32)  # (B, 2)
+            batch_indices = tf.range(tf.shape(indices)[0], dtype=tf.int32)[:, tf.newaxis]  # (B, 1)
+            full_indices = tf.concat([batch_indices, indices], axis=1)  # (B, 3)
+            # print(full_indices)
+
+            q_sa = tf.gather_nd(masked_q_values, full_indices)  # (B,)
+            # print("q_sa (before loss):", q_sa.numpy())
+            # print(q_sa.shape)
+
+            loss = tf.reduce_mean(tf.keras.losses.MSE(targets, q_sa))
+            grads = tape.gradient(loss, self.model.trainable_variables)
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+
+        # print("loss:", loss.numpy())  # 여기서 nan 나오면 원인 확정
+        # print("targets min/max:", np.min(targets), np.max(targets))
+        # print("q_sa min/max:", np.min(q_sa.numpy()), np.max(q_sa.numpy()))
+
+        self.train_step += 1
+        if self.train_step % self.update_target_freq == 0:
+            self.target_model.set_weights(self.model.get_weights())
+
+        return loss.numpy()
