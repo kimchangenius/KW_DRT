@@ -138,6 +138,10 @@ def main():
                     if curr_loss is not None:
                         total_loss += curr_loss
 
+                if len(agent.pending_buffer) != 0:
+                    for k, v in agent.pending_buffer.pending.items():
+                        print(k)
+                        pprint(v)
                 assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
 
                 # env.print_statistics()
@@ -158,6 +162,7 @@ def main():
 
     print(total_rewards)
     print(total_losses)
+    agent.target_model.save_weights("dqn_weights.h5")
 
 
 if __name__ == "__main__":

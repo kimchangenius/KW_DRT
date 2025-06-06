@@ -2,7 +2,7 @@ import random
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=100000):
+    def __init__(self, capacity=10000):
         self.buffer = []
         self.capacity = capacity
         self.position = 0
