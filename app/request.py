@@ -23,7 +23,8 @@ class Request:
         # 가변 (매 시간 업데이트 필요)
         self.status = RequestStatus.PENDING
         self.waiting_time = -1
-        self.in_vehicle_time = -1
+        self.in_vehicle_time = 0
+        self.detour_time = -1
         self.arrival_due_left = -1
         self.assigned_v_id = -1
         self.slot_idx = -1

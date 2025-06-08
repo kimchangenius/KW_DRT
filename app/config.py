@@ -10,3 +10,12 @@ REQUEST_INPUT_DIM = 55
 RELATION_INPUT_DIM = 2
 
 POSSIBLE_ACTION = MAX_NUM_REQUEST + 1
+
+config_list = [
+    {
+        "hidden_dim": 128
+    },
+    {
+        "hidden_dim": 256
+    }
+]

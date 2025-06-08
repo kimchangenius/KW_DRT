@@ -16,6 +16,12 @@ class Vehicle:
         self.target_arrival_time = -1
         self.num_passengers = 0
 
+        # Logging
+        self.num_accept = 0
+        self.num_serve = 0
+        self.idle_time = 0
+        self.on_service_driving_time = 0
+
     def __str__(self):
         return (f"[V](id={self.id} / "
                 f"{self.curr_node} -> {self.next_node} / "

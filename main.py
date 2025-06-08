@@ -1,71 +1,25 @@
 import os
-import csv
-import numpy as np
-import pandas as pd
-import tensorflow as tf
 import app.config as cfg
-
 from pprint import pprint
-from app.env import RideSharingEnvironment
+from app.env_builder import EnvBuilder
 from app.agent import DQNAgent
-from app.request import Request
-from app.network import DRTNetwork
 
 CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
 RESULT_PATH = os.path.join(CURR_PATH, 'result')
-EPISODES_PATH = os.path.join(RESULT_PATH, 'episodes')
-PASSENGER_PATH = os.path.join(DATA_PATH, 'passengers.csv')
-VEH_POS_PATH = os.path.join(DATA_PATH, 'vehicle_positions.csv')
-OD_MATRIX_PATH = os.path.join(DATA_PATH, 'od_matrix.csv')
-DQN_WEIGHT_PATH = os.path.join(RESULT_PATH, "dqn_model_weights_final.weight.h5")
 
+episodes = 500
+update_freq = 10
+final_train_steps = 5
 
-def load_requests(path, network):
-    requests = []
-    with open(path, newline='', encoding="utf-8-sig") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            req = Request(
-                request_id=int(row["User_ID"]),
-                from_node_id=int(row["Start_node"]),
-                to_node_id=int(row["End_node"]),
-                request_time=int(row["Request_time"]),
-                network=network
-            )
-            requests.append(req)
-    return requests
+def train_ddqn(env_builder, config):
+    env = env_builder.build()
+    hidden_dim = config["hidden_dim"]
 
-
-def main():
-    network = DRTNetwork()
-    network.set_od_matrix(OD_MATRIX_PATH)
-
-    request_list = load_requests(PASSENGER_PATH, network)
-    request_list.sort(key=lambda r: r.request_time)
-    for r in request_list:
-        tt = network.get_duration(r.from_node_id, r.to_node_id)
-        r.set_travel_time(tt)
-
-    vehicle_positions = pd.read_csv(VEH_POS_PATH)['initial_position'].tolist()
-
-    print("Data Load & Network Setup Complete")
-
-    agent = DQNAgent(hidden_dim=128)
-    # agent.load_model(DQN_WEIGHT_PATH)
-
-    env = RideSharingEnvironment(
-        network=network,
-        original_request_list=request_list,
-        vehicle_init_pos=vehicle_positions
-    )
+    agent = DQNAgent(hidden_dim=hidden_dim)
 
     total_rewards = []
     total_losses = []
-
-    episodes = 500
-    update_freq = 10
-    final_train_steps = 5
     transition_id = 0
     for ep in range(episodes):
         # print('\n============ Ep : {} ============'.format(ep))
@@ -144,10 +98,18 @@ def main():
                         pprint(v)
                 assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
 
-                # env.print_statistics()
-                # print('Total Reward: {}'.format(total_reward))
-                # print('Total Loss: {}'.format(total_loss))
+                num_accepted = 0
+                num_served = 0
+                for v in env.vehicle_list:
+                    num_accepted += v.num_accept
+                    num_served += v.num_serve
+                    v.on_service_driving_time = env.curr_time - v.idle_time
                 print('====== Ep: {} / Reward: {} / Loss: {} / eps: {} ======'.format(ep, total_reward, total_loss, agent.epsilon))
+                print(num_accepted, num_served)
+                for v in env.vehicle_list:
+                    print(v.idle_time, v.on_service_driving_time, env.curr_time)
+                for r in env.done_request_list:
+                    print(r.waiting_time, r.in_vehicle_time)
                 total_rewards.append(total_reward)
                 total_losses.append(total_loss)
                 # print('Num Transitions: {}'.format(len(agent.replay_buffer)))
@@ -160,10 +122,17 @@ def main():
 
         agent.decay_epsilon()
 
+    # TODO: Write CSV
     print(total_rewards)
     print(total_losses)
-    agent.target_model.save_weights("dqn_weights.h5")
+    # agent.model.save_weights("dqn_weights.h5")
 
+
+def main():
+    env_builder = EnvBuilder(data_dir=DATA_PATH, result_dir=RESULT_PATH)
+
+    for params in cfg.config_list:
+        train_ddqn(env_builder, params)
 
 if __name__ == "__main__":
     main()

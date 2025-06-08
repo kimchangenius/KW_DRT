@@ -29,6 +29,7 @@ class RideSharingEnvironment:
         self.relation_state = None
         self.state = None
 
+        # Logging
         self.logs = []
 
     def reset(self):
@@ -44,6 +45,7 @@ class RideSharingEnvironment:
         self.initialize_vehicles()
         self.handle_time_update()
         self.sync_state()
+
         return self.state
 
     def print_vehicles(self):
@@ -166,6 +168,9 @@ class RideSharingEnvironment:
                     d_action_id = "{}_2".format(r.id)
                     d_reward_list.append([p_action_id, 0.5])
                     d_reward_list.append([d_action_id, 0.5])
+
+                    # Logging
+                    v.num_serve += 1
 
         # Request 업데이트
         cancelled_list = []
@@ -347,6 +352,9 @@ class RideSharingEnvironment:
         if action_idx == cfg.POSSIBLE_ACTION - 1:
             # Reject
             v.status = VehicleStatus.REJECT
+
+            # Logging
+            v.idle_time += 1
         else:
             # Matching
             # 어떤 요청이 채택된 경우 - Pickup 하러 가거나 Dropoff 하러 가야 함
@@ -368,6 +376,9 @@ class RideSharingEnvironment:
                 # Pickup 결정 보상 (최대 1점, 즉시 보상)
                 reward = 0.5 * (1 - pickup_duration / self.network.max_duration)
                 + 0.5 * (1 - r.waiting_time / cfg.MAX_WAIT_TIME)
+
+                # Logging
+                v.num_accept += 1
 
                 # 만약 Pickup이 즉시 완료된다면
                 if v.curr_node == v.next_node:
@@ -429,6 +440,9 @@ class RideSharingEnvironment:
                     action_id = "{}_1".format(r.id)
                     info['action_id_list'] = [action_id]
                     info['reward'] = 0.5
+
+                    # Logging
+                    v.num_serve += 1
 
         self.sync_state()
         self.curr_step += 1
