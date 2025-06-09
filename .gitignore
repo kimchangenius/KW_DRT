@@ -5,3 +5,5 @@ __pycache__/
 *.pyo
 *.swp
 .DS_Store
+result/*
+!result/.gitkeep

@@ -1,3 +1,5 @@
+import itertools
+
 MAX_NUM_VEHICLES = 4
 
 MAX_NUM_REQUEST = 20
@@ -11,11 +13,15 @@ RELATION_INPUT_DIM = 2
 
 POSSIBLE_ACTION = MAX_NUM_REQUEST + 1
 
+param_grid = {
+    "hidden_dim": [64, 128, 256],
+    "batch_size": [64, 128]
+}
+
+keys = list(param_grid.keys())
+values = list(param_grid.values())
+
 config_list = [
-    {
-        "hidden_dim": 128
-    },
-    {
-        "hidden_dim": 256
-    }
+    dict(zip(keys, combination))
+    for combination in itertools.product(*values)
 ]

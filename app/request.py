@@ -24,12 +24,12 @@ class Request:
         self.status = RequestStatus.PENDING
         self.waiting_time = -1
         self.in_vehicle_time = 0
-        self.detour_time = -1
         self.arrival_due_left = -1
         self.assigned_v_id = -1
         self.slot_idx = -1
 
         # 기록용
+        self.detour_time = -1
         self.pickup_at = None
         self.dropoff_at = None
 

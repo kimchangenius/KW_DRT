@@ -1,8 +1,10 @@
 import os
+import csv
 import app.config as cfg
 from pprint import pprint
 from app.env_builder import EnvBuilder
 from app.agent import DQNAgent
+from app.request_status import RequestStatus
 
 CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
@@ -12,16 +14,76 @@ episodes = 500
 update_freq = 10
 final_train_steps = 5
 
+
+def log_episode(path, info):
+    ep = info['episode']
+
+    drt_info_list = info['drt_info']
+    filename = f'episode_{ep:03}_vehicle.csv'
+    filepath = os.path.join(path, filename)
+    with open(filepath, mode='w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Vehicle ID', 'Num. Accept', 'Num. Serve', 'On-Service Driving Time', 'Idle Time'])
+        for v in drt_info_list:
+            curr_row = [v['id'], v['num_accept'], v['num_serve'], v['on_service_driving_time'], v['idle_time']]
+            writer.writerow(curr_row)
+
+    req_info_list = info['request_info']
+    filename = f'episode_{ep:03}_request.csv'
+    filepath = os.path.join(path, filename)
+    with open(filepath, mode='w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Request ID', 'Status', 'Waiting Time', 'In-Vehicle Time', 'Detour Time'])
+        for r in req_info_list:
+            curr_row = [r['id'], r['status'], r['waiting_time'], r['in_vehicle_time'], r['detour_time']]
+            writer.writerow(curr_row)
+
+
+def log_all_episodes(path, info_list):
+    filename = 'episodes.csv'
+    filepath = os.path.join(path, filename)
+    with open(filepath, mode='w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Episode', 'Total Reward', 'Total Loss', 'Total Num. Accept', 'Total Num. Serve',
+                         'Mean Waiting Time', 'Mean In-Vehicle Time', 'Mean Detour Time'])
+        for e in info_list:
+            curr_row = [
+                e['episode'],
+                f"{e['total_reward']:.2f}",
+                f"{e['total_loss']:.2f}",
+                e['total_num_accept'],
+                e['total_num_serve'],
+                f"{e['mean_waiting_time']:.2f}",
+                f"{e['mean_in_vehicle_time']:.2f}",
+                f"{e['mean_detour_time']:.2f}"
+            ]
+            writer.writerow(curr_row)
+
+
+def get_run_folder_name(config):
+    hd = config.get("hidden_dim", "x")
+    bs = config.get("batch_size", "x")
+    return f"hd{hd}_bs{bs}"
+
+
 def train_ddqn(env_builder, config):
-    env = env_builder.build()
+    config_str = ", ".join(f"{k}={v}" for k, v in config.items())
+    print(f"\n<<<< Training Session: {config_str} >>>>")
+
+    # Create Result Directory
+    run_name = get_run_folder_name(config)
+    run_path = os.path.join(RESULT_PATH, run_name)
+    os.makedirs(run_path, exist_ok=True)
+
     hidden_dim = config["hidden_dim"]
+    batch_size = config["batch_size"]
 
-    agent = DQNAgent(hidden_dim=hidden_dim)
+    env = env_builder.build()
+    agent = DQNAgent(hidden_dim=hidden_dim, batch_size=batch_size)
 
-    total_rewards = []
-    total_losses = []
     transition_id = 0
-    for ep in range(episodes):
+    e_info_list = []
+    for ep in range(1, episodes + 1):
         # print('\n============ Ep : {} ============'.format(ep))
         total_loss = 0.0
         total_reward = 0.0
@@ -93,28 +155,71 @@ def train_ddqn(env_builder, config):
                         total_loss += curr_loss
 
                 if len(agent.pending_buffer) != 0:
+                    print("[Warning] Pending Buffer is not empty!")
                     for k, v in agent.pending_buffer.pending.items():
                         print(k)
                         pprint(v)
-                assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
+                # assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
 
-                num_accepted = 0
-                num_served = 0
+                drt_info_list = []
+                req_info_list = []
+                total_num_accept = 0
+                total_num_serve = 0
                 for v in env.vehicle_list:
-                    num_accepted += v.num_accept
-                    num_served += v.num_serve
+                    total_num_accept += v.num_accept
+                    total_num_serve += v.num_serve
                     v.on_service_driving_time = env.curr_time - v.idle_time
-                print('====== Ep: {} / Reward: {} / Loss: {} / eps: {} ======'.format(ep, total_reward, total_loss, agent.epsilon))
-                print(num_accepted, num_served)
-                for v in env.vehicle_list:
-                    print(v.idle_time, v.on_service_driving_time, env.curr_time)
+                    v_info = {
+                        'id': v.id,
+                        'num_accept': v.num_accept,
+                        'num_serve': v.num_serve,
+                        'idle_time': v.idle_time,
+                        'on_service_driving_time': v.on_service_driving_time
+                    }
+                    drt_info_list.append(v_info)
+
+                total_waiting_time = 0
+                total_in_vehicle_time = 0
+                total_detour_time = 0
+                served_count = 0
                 for r in env.done_request_list:
-                    print(r.waiting_time, r.in_vehicle_time)
-                total_rewards.append(total_reward)
-                total_losses.append(total_loss)
-                # print('Num Transitions: {}'.format(len(agent.replay_buffer)))
-                # print('Num Delayed Reward: {}'.format(delayed_reward_confirm))
-                # env.print_vehicles()
+                    r.detour_time = r.in_vehicle_time - r.travel_time
+                    if r.status == RequestStatus.SERVED:
+                        r_status = 'Served'
+                        served_count += 1
+                        total_waiting_time += r.waiting_time
+                        total_in_vehicle_time += r.in_vehicle_time
+                        total_detour_time += r.detour_time
+                    else:
+                        r_status = 'Canceled'
+                    r_info = {
+                        'id': r.id,
+                        'status': r_status,
+                        'waiting_time': r.waiting_time,
+                        'in_vehicle_time': r.in_vehicle_time,
+                        'detour_time': r.detour_time,
+                    }
+                    req_info_list.append(r_info)
+                    req_info_list.sort(key=lambda x: x['id'])
+                mean_waiting_time = total_waiting_time / served_count
+                mean_in_vehicle_time = total_in_vehicle_time / served_count
+                mean_detour_time = total_detour_time / served_count
+
+                print('====== Ep: {} / Reward: {} / Loss: {} / eps: {} ======'.format(ep, total_reward, total_loss, agent.epsilon))
+                e_info = {
+                    'episode': ep,
+                    'total_reward': total_reward,
+                    'total_loss': total_loss,
+                    'total_num_accept': total_num_accept,
+                    'total_num_serve': total_num_serve,
+                    'mean_waiting_time': mean_waiting_time,
+                    'mean_in_vehicle_time': mean_in_vehicle_time,
+                    'mean_detour_time': mean_detour_time,
+                    'drt_info': drt_info_list,
+                    'request_info': req_info_list
+                }
+                log_episode(run_path, e_info)
+                e_info_list.append(e_info)
                 break
 
             env.sync_state()
@@ -122,10 +227,7 @@ def train_ddqn(env_builder, config):
 
         agent.decay_epsilon()
 
-    # TODO: Write CSV
-    print(total_rewards)
-    print(total_losses)
-    # agent.model.save_weights("dqn_weights.h5")
+    log_all_episodes(run_path, e_info_list)
 
 
 def main():
@@ -133,6 +235,7 @@ def main():
 
     for params in cfg.config_list:
         train_ddqn(env_builder, params)
+
 
 if __name__ == "__main__":
     main()

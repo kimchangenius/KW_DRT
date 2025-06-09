@@ -10,7 +10,7 @@ from tensorflow.keras.layers import Input, Dense, TimeDistributed, Lambda, Conca
 
 
 class DQNAgent:
-    def __init__(self, hidden_dim, batch_size=32):
+    def __init__(self, hidden_dim, batch_size):
         self.hidden_dim = hidden_dim
         self.batch_size = batch_size
 
@@ -20,7 +20,7 @@ class DQNAgent:
 
         self.train_step = 0
         self.update_target_freq = 500
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
 
         self.gamma = 0.99
         self.epsilon = 1.0
