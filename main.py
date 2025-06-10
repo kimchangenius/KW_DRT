@@ -63,7 +63,8 @@ def log_all_episodes(path, info_list):
 def get_run_folder_name(config):
     hd = config.get("hidden_dim", "x")
     bs = config.get("batch_size", "x")
-    return f"hd{hd}_bs{bs}"
+    lr = config.get("learning_rate", "x")
+    return f"hd{hd}_bs{bs}_lr{lr}"
 
 
 def train_ddqn(env_builder, config):
@@ -75,14 +76,17 @@ def train_ddqn(env_builder, config):
     run_path = os.path.join(RESULT_PATH, run_name)
     os.makedirs(run_path, exist_ok=True)
 
-    hidden_dim = config["hidden_dim"]
-    batch_size = config["batch_size"]
+    hd = config["hidden_dim"]
+    bs = config["batch_size"]
+    lr = config["learning_rate"]
 
     env = env_builder.build()
-    agent = DQNAgent(hidden_dim=hidden_dim, batch_size=batch_size)
+    agent = DQNAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
 
     transition_id = 0
     e_info_list = []
+    best_reward = float('-inf')
+
     for ep in range(1, episodes + 1):
         # print('\n============ Ep : {} ============'.format(ep))
         total_loss = 0.0
@@ -156,9 +160,10 @@ def train_ddqn(env_builder, config):
 
                 if len(agent.pending_buffer) != 0:
                     print("[Warning] Pending Buffer is not empty!")
-                    for k, v in agent.pending_buffer.pending.items():
-                        print(k)
-                        pprint(v)
+                    # for k, v in agent.pending_buffer.pending.items():
+                    #     print(k)
+                    #     pprint(v)
+                    agent.pending_buffer.clear()
                 # assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
 
                 drt_info_list = []
@@ -220,6 +225,14 @@ def train_ddqn(env_builder, config):
                 }
                 log_episode(run_path, e_info)
                 e_info_list.append(e_info)
+
+                # Save Model
+                if total_reward > best_reward:
+                    best_reward = total_reward
+                    model_name = "{}.h5".format(get_run_folder_name(config))
+                    model_path = os.path.join(RESULT_PATH, model_name)
+                    agent.save_model(model_path)
+
                 break
 
             env.sync_state()

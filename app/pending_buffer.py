@@ -14,5 +14,8 @@ class PendingBuffer:
     def cancel(self, action_id):
         self.pending.pop(action_id, None)  # 또는 보상 -1 부여
 
+    def clear(self):
+        self.pending.clear()
+
     def __len__(self):
         return len(self.pending)

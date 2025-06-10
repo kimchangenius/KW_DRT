@@ -10,9 +10,10 @@ from tensorflow.keras.layers import Input, Dense, TimeDistributed, Lambda, Conca
 
 
 class DQNAgent:
-    def __init__(self, hidden_dim, batch_size):
+    def __init__(self, hidden_dim, batch_size, learning_rate):
         self.hidden_dim = hidden_dim
         self.batch_size = batch_size
+        self.learning_rate = learning_rate
 
         self.model = self.build_model()
         self.target_model = self.build_model()

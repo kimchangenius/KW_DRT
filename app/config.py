@@ -1,6 +1,6 @@
 import itertools
 
-MAX_NUM_VEHICLES = 4
+MAX_NUM_VEHICLES = 2
 
 MAX_NUM_REQUEST = 20
 VEH_CAPACITY = 5
@@ -14,8 +14,11 @@ RELATION_INPUT_DIM = 2
 POSSIBLE_ACTION = MAX_NUM_REQUEST + 1
 
 param_grid = {
-    "hidden_dim": [64, 128, 256],
-    "batch_size": [64, 128]
+    # "hidden_dim": [64, 128, 256],
+    "hidden_dim": [128],
+    # "batch_size": [32, 64, 128]
+    "batch_size": [16],
+    "learning_rate": [1e-4, 1e-5, 1e-6]
 }
 
 keys = list(param_grid.keys())
