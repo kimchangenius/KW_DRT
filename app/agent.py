@@ -41,7 +41,7 @@ class DQNAgent:
             self.target_model.set_weights(self.model.get_weights())
             print(f"Model weights loaded at {file_path}")
         else:
-            print(f"No model weights loaded at{file_path}")
+            print(f"No model weights loaded at {file_path}")
 
     def build_model(self):
         vehicle_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")  # (B, V, Dv)
