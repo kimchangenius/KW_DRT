@@ -5,14 +5,12 @@ from pprint import pprint
 from app.env_builder import EnvBuilder
 from app.agent import DQNAgent
 from app.request_status import RequestStatus
+from app.action_type import ActionType
+import time
 
 CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
 RESULT_PATH = os.path.join(CURR_PATH, 'result')
-
-episodes = 500
-update_freq = 10
-final_train_steps = 5
 
 
 def log_episode(path, info):
@@ -37,6 +35,14 @@ def log_episode(path, info):
         for r in req_info_list:
             curr_row = [r['id'], r['status'], r['waiting_time'], r['in_vehicle_time'], r['detour_time']]
             writer.writerow(curr_row)
+
+    seq_list = info['event_sequence']
+    filename = f'episode_{ep:03}_seq.txt'
+    filepath = os.path.join(path, filename)
+    with open(filepath, "w") as f:
+        for i, route in enumerate(seq_list):
+            route_str = " -> ".join(route)
+            f.write(f"DRT{i + 1}: {route_str}\n")
 
 
 def log_all_episodes(path, info_list):
@@ -67,14 +73,19 @@ def get_run_folder_name(config):
     return f"hd{hd}_bs{bs}_lr{lr}"
 
 
-def train_ddqn(env_builder, config):
+def train_ddqn(env_builder, config, write_result=False):
+    episodes = 500
+    update_freq = 10
+    final_train_steps = 5
+
     config_str = ", ".join(f"{k}={v}" for k, v in config.items())
     print(f"\n<<<< Training Session: {config_str} >>>>")
 
     # Create Result Directory
-    run_name = get_run_folder_name(config)
-    run_path = os.path.join(RESULT_PATH, run_name)
-    os.makedirs(run_path, exist_ok=True)
+    if write_result is True:
+        run_name = get_run_folder_name(config)
+        run_path = os.path.join(RESULT_PATH, run_name)
+        os.makedirs(run_path, exist_ok=True)
 
     hd = config["hidden_dim"]
     bs = config["batch_size"]
@@ -94,6 +105,13 @@ def train_ddqn(env_builder, config):
         state = env.reset()
 
         delayed_reward_confirm = 0
+
+        veh_event_list = []
+        for _ in range(len(env.vehicle_list)):
+            veh_event_list.append([])
+
+        start_time = time.time()
+
         while True:
             # print('\n============ Time : {} ============'.format(env.curr_time))
             # env.print_vehicles()
@@ -105,6 +123,13 @@ def train_ddqn(env_builder, config):
                 action_mask = env.get_action_mask()
                 action = agent.act(state, action_mask)
                 env.enrich_action(action)
+                if action[2]['type'] != ActionType.REJECT:
+                    at = 'D'
+                    if action[2]['type'] == ActionType.PICKUP:
+                        at = 'P'
+                    seq = "{}_{}".format(at, action[2]['r_id'])
+                    veh_event_list[action[0]].append(seq)
+                    # print(seq)
 
                 next_state, reward, info = env.step(action)
                 next_action_mask = env.get_action_mask()
@@ -220,27 +245,34 @@ def train_ddqn(env_builder, config):
                     'mean_waiting_time': mean_waiting_time,
                     'mean_in_vehicle_time': mean_in_vehicle_time,
                     'mean_detour_time': mean_detour_time,
+                    'event_sequence': veh_event_list,
                     'drt_info': drt_info_list,
                     'request_info': req_info_list
                 }
-                log_episode(run_path, e_info)
+                if write_result is True:
+                    log_episode(run_path, e_info)
                 e_info_list.append(e_info)
 
                 # Save Model
                 if total_reward > best_reward:
                     best_reward = total_reward
-                    model_name = "{}.h5".format(get_run_folder_name(config))
-                    model_path = os.path.join(RESULT_PATH, model_name)
-                    agent.save_model(model_path)
+                    if write_result is True:
+                        model_name = "{}.h5".format(get_run_folder_name(config))
+                        model_path = os.path.join(RESULT_PATH, model_name)
+                        agent.save_model(model_path)
 
                 break
 
             env.sync_state()
             state = env.state
 
+        end_time = time.time()
+        print(f"실행 시간: {end_time - start_time:.6f}초")
+
         agent.decay_epsilon()
 
-    log_all_episodes(run_path, e_info_list)
+    if write_result is True:
+        log_all_episodes(run_path, e_info_list)
 
 
 def test_ddqn(env_builder, hidden_dim, model_name):
@@ -357,10 +389,10 @@ def test_ddqn(env_builder, hidden_dim, model_name):
 def main():
     env_builder = EnvBuilder(data_dir=DATA_PATH, result_dir=RESULT_PATH)
 
-    test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
+    # test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
 
-    # for params in cfg.config_list:
-    #     train_ddqn(env_builder, params)
+    for params in cfg.config_list:
+        train_ddqn(env_builder, params, write_result=False)
 
 
 
