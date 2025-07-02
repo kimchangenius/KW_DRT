@@ -74,7 +74,7 @@ def get_run_folder_name(config):
 
 
 def train_ddqn(env_builder, config, write_result=False):
-    episodes = 500
+    episodes = 10
     update_freq = 10
     final_train_steps = 5
 
@@ -154,6 +154,7 @@ def train_ddqn(env_builder, config, write_result=False):
                 if info['has_delayed_reward'] is True:
                     for action_id in info['action_id_list']:
                         d_reward = info['reward']
+                        print(f"[Debug] Step {env.curr_step}: 즉시 완료로 인한 지연 보상 - {action_id} (보상: {d_reward})")
                         agent.confirm_and_remember(action_id, d_reward)
                         delayed_reward_confirm += 1
 
@@ -161,6 +162,15 @@ def train_ddqn(env_builder, config, write_result=False):
                     curr_loss = agent.train()
                     if curr_loss is not None:
                         total_loss += curr_loss
+                    
+                    # Pending Buffer 상태 확인 (디버깅용)
+                    if len(agent.pending_buffer) > 0:
+                        print(f"[Debug] Step {env.curr_step}: Pending Buffer에 {len(agent.pending_buffer)}개 행동 대기 중")
+                        for action_id in agent.pending_buffer.pending.keys():
+                            print(f"  - {action_id}")
+                    
+                    # 행동 정보 출력 (디버깅용)
+                    print(f"[Debug] Step {env.curr_step}: Vehicle {action[0]} -> {action[2]['type']} (Request {action[2]['r_id']})")
 
                 total_reward += reward
                 state = next_state
@@ -169,7 +179,9 @@ def train_ddqn(env_builder, config, write_result=False):
             d_reward_list = env.handle_time_update()
 
             for pair in d_reward_list:
-                agent.confirm_and_remember(pair[0], pair[1])
+                action_id, reward = pair
+                print(f"[Debug] Step {env.curr_step}: 시간 업데이트로 인한 지연 보상 - {action_id} (보상: {reward})")
+                agent.confirm_and_remember(action_id, reward)
                 delayed_reward_confirm += 1
 
             if env.is_done():
@@ -185,9 +197,9 @@ def train_ddqn(env_builder, config, write_result=False):
 
                 if len(agent.pending_buffer) != 0:
                     print("[Warning] Pending Buffer is not empty!")
-                    # for k, v in agent.pending_buffer.pending.items():
-                    #     print(k)
-                    #     pprint(v)
+                    for k, v in agent.pending_buffer.pending.items():
+                        print(k)
+                        #pprint(v)
                     agent.pending_buffer.clear()
                 # assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
 
@@ -392,7 +404,7 @@ def main():
     # test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
 
     for params in cfg.config_list:
-        train_ddqn(env_builder, params, write_result=False)
+        train_ddqn(env_builder, params, write_result=True)
 
 
 
