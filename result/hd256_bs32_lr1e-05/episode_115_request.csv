@@ -1,0 +1,9 @@
+Request ID,Status,Waiting Time,In-Vehicle Time,Detour Time
+1,Served,3,24,15.0
+2,Canceled,10,0,-4.0
+3,Canceled,10,0,-4.0
+4,Served,5,7,1.0
+5,Served,4,6,0.0
+6,Served,8,27,22.0
+7,Served,3,17,11.0
+8,Served,2,14,8.0
