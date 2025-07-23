@@ -78,7 +78,7 @@ class DQNAgent:
 
     def act(self, state, action_mask):
         info = {
-            'mode': None
+            'mode': None # 실제 사용 x, env.enrich_action에서 덮어짐.
         }
         if np.random.rand() < self.epsilon:
             info['mode'] = 'explore'
@@ -110,7 +110,7 @@ class DQNAgent:
         action = transition[1]
         action_id = action[2]['id']
         self.pending_buffer.add(action_id, transition)
-
+        
     def confirm_and_remember(self, action_id, reward):
         transition = self.pending_buffer.confirm(action_id, reward)
         if transition is not None:
