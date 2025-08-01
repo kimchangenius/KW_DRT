@@ -76,27 +76,73 @@ class DQNAgent:
 
         return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_total)
 
+    # def act(self, state, action_mask):
+    #     info = {
+    #         'mode': None # 실제 사용 x, env.enrich_action에서 덮어짐.
+    #     }
+    #     if np.random.rand() < self.epsilon:
+    #         info['mode'] = 'explore'
+    #         valid_actions = tf.where(action_mask == 1)
+    #         rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
+    #         rand_action = valid_actions[rand_idx]
+    #         rand_action = rand_action.numpy()
+    #         vehicle_idx = int(rand_action[0])
+    #         action_idx = int(rand_action[1])
+    #     else:
+    #         info['mode'] = 'exploit'
+    #         q_values = self.model.predict(state, verbose=0)
+    #         masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e3, dtype=tf.float32))
+    #         flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
+    #         vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
+    #         action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
+    #     return [vehicle_idx, action_idx, info]
+
     def act(self, state, action_mask):
         info = {
             'mode': None # 실제 사용 x, env.enrich_action에서 덮어짐.
         }
-        if np.random.rand() < self.epsilon:
+        
+        # 유효한 액션 먼저 확인
+        valid_actions = tf.where(action_mask == 1)
+        
+        if tf.shape(valid_actions)[0] == 0:
+            # 유효한 액션이 없는 경우 REJECT 선택
+            vehicle_idx = 0
+            action_idx = cfg.POSSIBLE_ACTION - 1  # REJECT
+            info['mode'] = 'fallback'
+        elif np.random.rand() < self.epsilon:
+            # 탐험: 유효한 액션 중에서 랜덤 선택
             info['mode'] = 'explore'
-            valid_actions = tf.where(action_mask == 1)
             rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
             rand_action = valid_actions[rand_idx]
             rand_action = rand_action.numpy()
             vehicle_idx = int(rand_action[0])
             action_idx = int(rand_action[1])
         else:
+            # 활용: Q-값 기반 선택 (안전한 마스킹)
             info['mode'] = 'exploit'
             q_values = self.model.predict(state, verbose=0)
-            masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e2, dtype=tf.float32))
-            flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
+            
+            # 더 안전한 마스킹: 무효한 액션에 매우 작은 값 할당
+            masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
+            
+            # 전체에서 argmax 후 유효성 재검증
+            flat_masked_q = tf.reshape(masked_q, (-1,))
+            flat_idx = tf.argmax(flat_masked_q).numpy()
+            
             vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
             action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
+            
+            # 선택된 액션이 실제로 유효한지 최종 확인
+            if action_mask[vehicle_idx][action_idx] != 1:
+                # 무효한 액션이 선택된 경우 유효한 액션 중 첫 번째로 대체
+                first_valid = valid_actions[0].numpy()
+                vehicle_idx = int(first_valid[0])
+                action_idx = int(first_valid[1])
+                info['mode'] = 'exploit_safe_fallback'
+                
         return [vehicle_idx, action_idx, info]
-
+        
     def decay_epsilon(self):
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay

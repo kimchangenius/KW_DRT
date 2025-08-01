@@ -18,8 +18,9 @@ param_grid = {
     "hidden_dim": [256],
     # "batch_size": [32, 64, 128]
     "batch_size": [32],
-    # "learning_rate": [1e-4, 1e-5, 1e-6]
-    "learning_rate": [1e-5]
+    # "learning_rate": [1e-4, 1e-5, 1e-6]\
+    "ppo_learning_rate": [1e-6],
+    "dqn_learning_rate": [1e-5]
 }
 
 keys = list(param_grid.keys())
