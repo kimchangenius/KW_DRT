@@ -84,7 +84,9 @@ def train_ppo(env_builder, config, write_result=False):
 
     # Create Result Directory
     if write_result is True:
-        run_name = get_run_folder_name(config)
+        ppo_folder_config = config.copy()
+        ppo_folder_config["learning_rate"] = config["ppo_learning_rate"]
+        run_name = get_run_folder_name(ppo_folder_config)
         run_path = os.path.join(RESULT_PATH, run_name)
         os.makedirs(run_path, exist_ok=True)
 
@@ -95,7 +97,10 @@ def train_ppo(env_builder, config, write_result=False):
     env = env_builder.build()
     agent = PPOAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
     
-    model_name = "{}.h5".format(get_run_folder_name(config))
+    # 기존 모델 로드 시도
+    ppo_config = config.copy()
+    ppo_config["learning_rate"] = config["ppo_learning_rate"]
+    model_name = "{}.h5".format(get_run_folder_name(ppo_config))
     model_path = os.path.join(RESULT_PATH, model_name)
     agent.load_model(model_path)
 
@@ -104,7 +109,6 @@ def train_ppo(env_builder, config, write_result=False):
     best_reward = float('-inf')
 
     for ep in range(1, episodes + 1):
-        # print('\n============ Ep : {} ============'.format(ep))
         total_loss = 0.0
         total_reward = 0.0
         state = env.reset()
@@ -118,13 +122,9 @@ def train_ppo(env_builder, config, write_result=False):
         start_time = time.time()
 
         while True:
-            # print('\n============ Time : {} ============'.format(env.curr_time))
-            # env.print_vehicles()
-            # env.print_active_requests()
+            
 
             while env.has_idle_vehicle():
-                # print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
-
                 action_mask = env.get_action_mask()
                 action = agent.act(state, action_mask)
                 env.enrich_action(action)
@@ -325,7 +325,10 @@ def train_ppo(env_builder, config, write_result=False):
                 if total_reward > best_reward:
                     best_reward = total_reward
                     if write_result is True:
-                        model_name = "{}.h5".format(get_run_folder_name(config))
+                        # PPO 전용 config 사용
+                        ppo_save_config = config.copy()
+                        ppo_save_config["learning_rate"] = config["ppo_learning_rate"]
+                        model_name = "{}.h5".format(get_run_folder_name(ppo_save_config))
                         model_path = os.path.join(RESULT_PATH, model_name)
                         agent.save_model(model_path)
 
@@ -342,7 +345,7 @@ def train_ppo(env_builder, config, write_result=False):
 
 
 def train_ddqn(env_builder, config, write_result=False):
-    episodes = 500
+    episodes = 5
     update_freq = 10
     final_train_steps = 5
 
@@ -351,7 +354,9 @@ def train_ddqn(env_builder, config, write_result=False):
 
     # Create Result Directory
     if write_result is True:
-        run_name = get_run_folder_name(config)
+        dqn_folder_config = config.copy()
+        dqn_folder_config["learning_rate"] = config["dqn_learning_rate"]
+        run_name = get_run_folder_name(dqn_folder_config)
         run_path = os.path.join(RESULT_PATH, run_name)
         os.makedirs(run_path, exist_ok=True)
 
@@ -362,7 +367,11 @@ def train_ddqn(env_builder, config, write_result=False):
     env = env_builder.build()
     agent = DQNAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
     
-    model_name = "{}.h5".format(get_run_folder_name(config))
+    # 기존 모델 로드 시도
+    # DQN 전용 config 생성 (dqn_learning_rate를 learning_rate로 변환)
+    dqn_config = config.copy()
+    dqn_config["learning_rate"] = config["dqn_learning_rate"]
+    model_name = "{}.h5".format(get_run_folder_name(dqn_config))
     model_path = os.path.join(RESULT_PATH, model_name)
     agent.load_model(model_path)
 
@@ -577,7 +586,10 @@ def train_ddqn(env_builder, config, write_result=False):
                 if total_reward > best_reward:
                     best_reward = total_reward
                     if write_result is True:
-                        model_name = "{}.h5".format(get_run_folder_name(config))
+                        # DQN 전용 config 사용
+                        dqn_save_config = config.copy()
+                        dqn_save_config["learning_rate"] = config["dqn_learning_rate"]
+                        model_name = "{}.h5".format(get_run_folder_name(dqn_save_config))
                         model_path = os.path.join(RESULT_PATH, model_name)
                         agent.save_model(model_path)
 
@@ -601,8 +613,8 @@ def main():
     # test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
 
     for params in cfg.config_list:
-        # train_ddqn(env_builder, params, write_result=True)
-        train_ppo(env_builder, params, write_result=True)
+        train_ddqn(env_builder, params, write_result=True)
+        # train_ppo(env_builder, params, write_result=True)
 
 
 if __name__ == "__main__":

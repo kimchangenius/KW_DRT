@@ -21,7 +21,7 @@ class DQNAgent:
 
         self.train_step = 0
         self.update_target_freq = 500
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 
         self.gamma = 0.99
         self.epsilon = 1.0
@@ -61,7 +61,7 @@ class DQNAgent:
         pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled, relation_input])  # (B, V, R, 2H + Drel)
 
         q_match = TimeDistributed(TimeDistributed(Dense(self.hidden_dim, activation='relu')))(pair_embed)  # (B, V, R, H)
-        q_match = TimeDistributed(TimeDistributed(Dense(1)))(q_match)  # (B, V, R, 1)
+        q_match = TimeDistributed(TimeDistributed(Dense(1, kernel_initializer='glorot_uniform', bias_initializer='zeros')))(q_match)  # (B, V, R, 1)
         q_match = Lambda(lambda x: tf.squeeze(x, axis=-1))(q_match)  # (B, V, R)
 
         r_summary = tf.reduce_mean(r_embed, axis=1)  # (B, H)
@@ -69,33 +69,15 @@ class DQNAgent:
         reject_context = Concatenate(axis=-1)([v_embed, r_summary])  # (B, V, 2H)
 
         q_reject = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(reject_context)
-        q_reject = TimeDistributed(Dense(1))(q_reject)  # (B, V, 1)
+        q_reject = TimeDistributed(Dense(1, kernel_initializer='glorot_uniform', bias_initializer='zeros'))(q_reject)  # (B, V, 1)
 
         # Concatenate along request dim → total 21 actions
         q_total = Concatenate(axis=-1)([q_match, q_reject])  # (B, V, R+1)
+        
+        # Q-값 범위 제한 (tanh로 -10~10 범위로 스케일링)
+        q_scaled = Lambda(lambda x: 10.0 * tf.tanh(x))(q_total)  # (-10, 10) 범위
 
-        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_total)
-
-    # def act(self, state, action_mask):
-    #     info = {
-    #         'mode': None # 실제 사용 x, env.enrich_action에서 덮어짐.
-    #     }
-    #     if np.random.rand() < self.epsilon:
-    #         info['mode'] = 'explore'
-    #         valid_actions = tf.where(action_mask == 1)
-    #         rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
-    #         rand_action = valid_actions[rand_idx]
-    #         rand_action = rand_action.numpy()
-    #         vehicle_idx = int(rand_action[0])
-    #         action_idx = int(rand_action[1])
-    #     else:
-    #         info['mode'] = 'exploit'
-    #         q_values = self.model.predict(state, verbose=0)
-    #         masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e3, dtype=tf.float32))
-    #         flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
-    #         vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
-    #         action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
-    #     return [vehicle_idx, action_idx, info]
+        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_scaled)
 
     def act(self, state, action_mask):
         info = {
@@ -166,66 +148,127 @@ class DQNAgent:
         if len(self.replay_buffer) < self.batch_size:
             return None
 
-        # print("\n\n================= Train : {} =================".format(self.train_step))
-        batch = self.replay_buffer.sample(self.batch_size)
+        try:
+            # print("\n\n================= Train : {} =================".format(self.train_step))
+            batch = self.replay_buffer.sample(self.batch_size)
 
-        # === Q(s', a')  ===
-        next_vehicle_tensor = np.array([b[3][0][0] for b in batch])
-        next_request_tensor = np.array([b[3][1][0] for b in batch])
-        next_relation_tensor = np.array([b[3][2][0] for b in batch])
-        next_states = [next_vehicle_tensor, next_request_tensor, next_relation_tensor]
+            # === Q(s', a') with numerical stability ===
+            next_vehicle_tensor = np.array([b[3][0][0] for b in batch])
+            next_request_tensor = np.array([b[3][1][0] for b in batch])
+            next_relation_tensor = np.array([b[3][2][0] for b in batch])
+            
+            # NaN/Inf 체크 및 정리 (보상 범위에 맞는 클리핑)
+            next_vehicle_tensor = np.nan_to_num(next_vehicle_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            next_request_tensor = np.nan_to_num(next_request_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            next_relation_tensor = np.nan_to_num(next_relation_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+            next_states = [next_vehicle_tensor, next_request_tensor, next_relation_tensor]
 
-        next_q_values = self.target_model.predict(next_states, verbose=0)  # (B, V, A)
-        next_action_mask = np.array([b[5]['nm'] for b in batch])
-        masked_next_q_values = tf.where(next_action_mask == 1, next_q_values, tf.constant(-1e1, dtype=tf.float32))
-        max_next_q = np.max(masked_next_q_values, axis=(1, 2))
+            next_q_values = self.target_model.predict(next_states, verbose=0)  # (B, V, A)
+            
+            # Q-값 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
+            next_q_values = tf.where(tf.math.is_finite(next_q_values), next_q_values, tf.zeros_like(next_q_values))
+            next_q_values = tf.clip_by_value(next_q_values, -10.0, 10.0)
+            
+            next_action_mask = np.array([b[5]['nm'] for b in batch])
+            masked_next_q_values = tf.where(next_action_mask == 1, next_q_values, tf.constant(-1e1, dtype=tf.float32))
+            max_next_q = np.max(masked_next_q_values, axis=(1, 2))
+            
+            # max_next_q 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
+            max_next_q = np.nan_to_num(max_next_q, nan=0.0, posinf=10.0, neginf=-10.0)
+            max_next_q = np.clip(max_next_q, -10.0, 10.0)
 
-        rewards = np.array([b[2] for b in batch])
-        dones = np.array([b[4] for b in batch])
-        targets = rewards + self.gamma * max_next_q * (1 - dones)
+            rewards = np.array([b[2] for b in batch], dtype=np.float32)
+            dones = np.array([b[4] for b in batch], dtype=np.float32)
+            
+            # Rewards와 dones 안정성 보장 (실제 보상 범위 유지)
+            rewards = np.nan_to_num(rewards, nan=0.0, posinf=10.0, neginf=-10.0)
+            rewards = np.clip(rewards, -10.0, 10.0)
+            
+            targets = rewards + self.gamma * max_next_q * (1 - dones)
+            targets = np.nan_to_num(targets, nan=0.0, posinf=10.0, neginf=-10.0)
+            targets = np.clip(targets, -10.0, 10.0)
 
-        # === Q(s, a)  ===
-        vehicle_tensor = np.array([b[0][0][0] for b in batch])  # (B, V, Dv)
-        request_tensor = np.array([b[0][1][0] for b in batch])  # (B, R, Dr)
-        relation_tensor = np.array([b[0][2][0] for b in batch])  # (B, V, R, Drel)
-        states = [vehicle_tensor, request_tensor, relation_tensor]
+            # === Q(s, a) with numerical stability ===
+            vehicle_tensor = np.array([b[0][0][0] for b in batch])  # (B, V, Dv)
+            request_tensor = np.array([b[0][1][0] for b in batch])  # (B, R, Dr)
+            relation_tensor = np.array([b[0][2][0] for b in batch])  # (B, V, R, Drel)
+            
+            # 입력 텐서 안정성 보장
+            vehicle_tensor = np.nan_to_num(vehicle_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            request_tensor = np.nan_to_num(request_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            relation_tensor = np.nan_to_num(relation_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+            states = [vehicle_tensor, request_tensor, relation_tensor]
 
-        # for name, tensor in zip(
-        #         ["vehicle", "request", "relation"],
-        #         states
-        # ):
-        #     print(f"{name}_tensor has NaN:", np.isnan(tensor).any())
-        #     print(f"{name}_tensor min/max:", np.min(tensor), np.max(tensor))
+            with tf.GradientTape() as tape:
+                q_values = self.model(states, training=True)
+                
+                # Q-값 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
+                q_values = tf.where(tf.math.is_finite(q_values), q_values, tf.zeros_like(q_values))
+                q_values = tf.clip_by_value(q_values, -10.0, 10.0)
+                
+                action_mask = np.array([b[5]['m'] for b in batch])
+                masked_q_values = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
 
-        with tf.GradientTape() as tape:
-            q_values = self.model(states, training=True)
-            # print(q_values)
-            action_mask = np.array([b[5]['m'] for b in batch])
+                actions_raw = np.array([b[1] for b in batch])  # (B, 3)
+                actions = actions_raw[:, :2]  # (B, 2)
+                indices = tf.constant(actions, dtype=tf.int32)  # (B, 2)
+                batch_indices = tf.range(tf.shape(indices)[0], dtype=tf.int32)[:, tf.newaxis]  # (B, 1)
+                full_indices = tf.concat([batch_indices, indices], axis=1)  # (B, 3)
 
-            masked_q_values = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
-            # print(masked_q_values)
+                q_sa = tf.gather_nd(masked_q_values, full_indices)  # (B,)
+                
+                # q_sa 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
+                q_sa = tf.where(tf.math.is_finite(q_sa), q_sa, tf.zeros_like(q_sa))
+                q_sa = tf.clip_by_value(q_sa, -10.0, 10.0)
 
-            actions_raw = np.array([b[1] for b in batch])  # (B, 3)
-            actions = actions_raw[:, :2]  # (B, 2)
-            indices = tf.constant(actions, dtype=tf.int32)  # (B, 2)
-            batch_indices = tf.range(tf.shape(indices)[0], dtype=tf.int32)[:, tf.newaxis]  # (B, 1)
-            full_indices = tf.concat([batch_indices, indices], axis=1)  # (B, 3)
-            # print(full_indices)
+                # Huber Loss 계산 (MSE보다 안정적)
+                diff = targets - q_sa
+                diff = tf.where(tf.math.is_finite(diff), diff, tf.zeros_like(diff))
+                
+                # Huber Loss: 작은 오차에는 MSE, 큰 오차에는 MAE
+                huber_delta = 1.0  # 임계값
+                abs_diff = tf.abs(diff)
+                is_small_error = abs_diff <= huber_delta
+                
+                small_error_loss = 0.5 * tf.square(diff)
+                large_error_loss = huber_delta * abs_diff - 0.5 * huber_delta * huber_delta
+                
+                huber_loss = tf.where(is_small_error, small_error_loss, large_error_loss)
+                loss = tf.reduce_mean(huber_loss)
+                
+                # Loss NaN 체크
+                if tf.math.is_nan(loss):
+                    print("[Warning] Loss is NaN! Setting to 0.")
+                    return 0.0
 
-            q_sa = tf.gather_nd(masked_q_values, full_indices)  # (B,)
-            # print("q_sa (before loss):", q_sa.numpy())
-            # print(q_sa.shape)
-
-            loss = tf.reduce_mean(tf.keras.losses.MSE(targets, q_sa))
+            # Gradients 계산 및 안정성 보장
             grads = tape.gradient(loss, self.model.trainable_variables)
-            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            if grads is not None:
+                # 그래디언트 NaN/Inf 체크 및 클리핑
+                safe_grads = []
+                for grad in grads:
+                    if grad is not None:
+                        # NaN/Inf를 0으로 대체
+                        safe_grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+                        # 그래디언트 노름 클리핑
+                        safe_grad = tf.clip_by_norm(safe_grad, 1.0)
+                        safe_grads.append(safe_grad)
+                    else:
+                        safe_grads.append(None)
+                
+                # 안전한 그래디언트만 적용
+                valid_grads_and_vars = [(g, v) for g, v in zip(safe_grads, self.model.trainable_variables) if g is not None]
+                if valid_grads_and_vars:
+                    self.optimizer.apply_gradients(valid_grads_and_vars)
 
-        # print("loss:", loss.numpy())  # 여기서 nan 나오면 원인 확정
-        # print("targets min/max:", np.min(targets), np.max(targets))
-        # print("q_sa min/max:", np.min(q_sa.numpy()), np.max(q_sa.numpy()))
+            self.train_step += 1
+            if self.train_step % self.update_target_freq == 0:
+                self.target_model.set_weights(self.model.get_weights())
 
-        self.train_step += 1
-        if self.train_step % self.update_target_freq == 0:
-            self.target_model.set_weights(self.model.get_weights())
+            return loss.numpy()
 
-        return loss.numpy()
+        except Exception as e:
+            print(f"[Error] Training failed: {e}")
+            return 0.0
