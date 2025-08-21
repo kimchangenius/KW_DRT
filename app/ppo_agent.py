@@ -14,14 +14,14 @@ class PPOAgent:
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         
-        # PPO specific hyperparameters (더 적극적으로 조정)
-        self.clip_ratio = 0.2  # 0.1 → 0.2 (더 큰 정책 변화 허용)
+        # PPO specific hyperparameters (안정화된 설정)
+        self.clip_ratio = 0.15  # 0.2 → 0.15 (더 보수적)
         self.gamma = 0.99
         self.gae_lambda = 0.95
-        self.entropy_coef = 0.01  # 0.05 → 0.01 (엔트로피 보너스 감소)
+        self.entropy_coef = 0.02  # 0.01 → 0.02 (탐험 장려)
         self.value_coef = 0.5
-        self.max_grad_norm = 1.0  # 0.3 → 1.0 (더 큰 그래디언트 허용)
-        self.target_kl = 0.02  # 0.005 → 0.02 (더 관대한 KL divergence 제한)
+        self.max_grad_norm = 0.5  # 1.0 → 0.5 (그래디언트 클리핑 강화)
+        self.target_kl = 0.01  # 0.02 → 0.01 (더 엄격한 KL 제한)
         
         # Learning rate scheduling
         self.initial_learning_rate = learning_rate
@@ -29,7 +29,7 @@ class PPOAgent:
         
         # PPO는 episode 기반 학습이 더 효과적
         self.episode_buffer = []  # 현재 에피소드의 transitions
-        self.update_frequency = 10  # 3 → 10 (더 많은 데이터로 학습)
+        self.update_frequency = 20  # 10 → 20 (더 안정적인 학습)
         
         # Build actor and critic networks
         self.actor = self.build_actor()
@@ -258,13 +258,30 @@ class PPOAgent:
         return should
         
     def update_learning_rate(self, kl_div):
-        """KL divergence 기반 적응적 learning rate 조정"""
+        """KL divergence 기반 적응적 learning rate 조정 (안전장치 포함)"""
+        # 안전장치: learning rate 범위 제한
+        min_lr = 1e-8
+        max_lr = 1e-3
+        
+        # 현재 learning rate가 이미 비정상적이면 리셋
+        if self.current_learning_rate > max_lr or self.current_learning_rate < min_lr:
+            print(f"[Warning] Learning rate {self.current_learning_rate:.2e} is abnormal! Resetting to {self.initial_learning_rate:.2e}")
+            self.current_learning_rate = self.initial_learning_rate
+        
+        # KL divergence가 너무 작으면 적응 비활성화 (학습이 안정화됨)
+        if kl_div < 1e-8:
+            # print(f"[Info] KL divergence too small ({kl_div:.8f}), skipping learning rate adaptation")
+            return
+            
         if kl_div > self.target_kl * 1.5:
-            self.current_learning_rate *= 0.5  # 감소
+            self.current_learning_rate *= 0.8  # 더 보수적으로 감소
             print(f"Learning rate decreased to {self.current_learning_rate:.6f}")
         elif kl_div < self.target_kl / 1.5:
-            self.current_learning_rate *= 1.2  # 증가
+            self.current_learning_rate *= 1.05  # 더 보수적으로 증가
             print(f"Learning rate increased to {self.current_learning_rate:.6f}")
+        
+        # 범위 재확인 및 클리핑
+        self.current_learning_rate = max(min_lr, min(max_lr, self.current_learning_rate))
         
         # 옵티마이저 learning rate 업데이트
         self.actor_optimizer.learning_rate.assign(self.current_learning_rate)
@@ -451,9 +468,9 @@ class PPOAgent:
                 # print(f"Early stopping at epoch {epoch+1}, KL div: {kl_div.numpy():.6f}")
                 break
             
-        # 적응적 learning rate 조정 
+        # 적응적 learning rate 조정 (비활성화 - 안정성 우선)
         final_kl_div = kl_div.numpy()
-        self.update_learning_rate(final_kl_div)  # 적응적 학습률 활성화
+        # self.update_learning_rate(final_kl_div)  # 적응적 학습률 비활성화
         
         # 버퍼 정리
         self.trajectory_buffer = []

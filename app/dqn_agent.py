@@ -74,8 +74,8 @@ class DQNAgent:
         # Concatenate along request dim → total 21 actions
         q_total = Concatenate(axis=-1)([q_match, q_reject])  # (B, V, R+1)
         
-        # Q-값 범위 제한 (tanh로 -10~10 범위로 스케일링)
-        q_scaled = Lambda(lambda x: 10.0 * tf.tanh(x))(q_total)  # (-10, 10) 범위
+        # Q-값 범위 제한 (tanh로 -5~5 범위로 스케일링)
+        q_scaled = Lambda(lambda x: 5.0 * tf.tanh(x))(q_total)  # (-5, 5) 범위
 
         return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_scaled)
 
@@ -158,9 +158,9 @@ class DQNAgent:
             next_relation_tensor = np.array([b[3][2][0] for b in batch])
             
             # NaN/Inf 체크 및 정리 (보상 범위에 맞는 클리핑)
-            next_vehicle_tensor = np.nan_to_num(next_vehicle_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
-            next_request_tensor = np.nan_to_num(next_request_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
-            next_relation_tensor = np.nan_to_num(next_relation_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            next_vehicle_tensor = np.nan_to_num(next_vehicle_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
+            next_request_tensor = np.nan_to_num(next_request_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
+            next_relation_tensor = np.nan_to_num(next_relation_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
             
             next_states = [next_vehicle_tensor, next_request_tensor, next_relation_tensor]
 
@@ -168,26 +168,26 @@ class DQNAgent:
             
             # Q-값 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
             next_q_values = tf.where(tf.math.is_finite(next_q_values), next_q_values, tf.zeros_like(next_q_values))
-            next_q_values = tf.clip_by_value(next_q_values, -10.0, 10.0)
+            next_q_values = tf.clip_by_value(next_q_values, -5.0, 5.0)
             
             next_action_mask = np.array([b[5]['nm'] for b in batch])
             masked_next_q_values = tf.where(next_action_mask == 1, next_q_values, tf.constant(-1e1, dtype=tf.float32))
             max_next_q = np.max(masked_next_q_values, axis=(1, 2))
             
             # max_next_q 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
-            max_next_q = np.nan_to_num(max_next_q, nan=0.0, posinf=10.0, neginf=-10.0)
-            max_next_q = np.clip(max_next_q, -10.0, 10.0)
+            max_next_q = np.nan_to_num(max_next_q, nan=0.0, posinf=5.0, neginf=-5.0)
+            max_next_q = np.clip(max_next_q, -5.0, 5.0)
 
             rewards = np.array([b[2] for b in batch], dtype=np.float32)
             dones = np.array([b[4] for b in batch], dtype=np.float32)
             
             # Rewards와 dones 안정성 보장 (실제 보상 범위 유지)
-            rewards = np.nan_to_num(rewards, nan=0.0, posinf=10.0, neginf=-10.0)
-            rewards = np.clip(rewards, -10.0, 10.0)
+            rewards = np.nan_to_num(rewards, nan=0.0, posinf=5.0, neginf=-5.0)
+            rewards = np.clip(rewards, -5.0, 5.0)
             
             targets = rewards + self.gamma * max_next_q * (1 - dones)
-            targets = np.nan_to_num(targets, nan=0.0, posinf=10.0, neginf=-10.0)
-            targets = np.clip(targets, -10.0, 10.0)
+            targets = np.nan_to_num(targets, nan=0.0, posinf=5.0, neginf=-5.0)
+            targets = np.clip(targets, -5.0, 5.0)
 
             # === Q(s, a) with numerical stability ===
             vehicle_tensor = np.array([b[0][0][0] for b in batch])  # (B, V, Dv)
@@ -195,9 +195,9 @@ class DQNAgent:
             relation_tensor = np.array([b[0][2][0] for b in batch])  # (B, V, R, Drel)
             
             # 입력 텐서 안정성 보장
-            vehicle_tensor = np.nan_to_num(vehicle_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
-            request_tensor = np.nan_to_num(request_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
-            relation_tensor = np.nan_to_num(relation_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+            vehicle_tensor = np.nan_to_num(vehicle_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
+            request_tensor = np.nan_to_num(request_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
+            relation_tensor = np.nan_to_num(relation_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
             
             states = [vehicle_tensor, request_tensor, relation_tensor]
 
@@ -206,7 +206,7 @@ class DQNAgent:
                 
                 # Q-값 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
                 q_values = tf.where(tf.math.is_finite(q_values), q_values, tf.zeros_like(q_values))
-                q_values = tf.clip_by_value(q_values, -10.0, 10.0)
+                q_values = tf.clip_by_value(q_values, -5.0, 5.0)
                 
                 action_mask = np.array([b[5]['m'] for b in batch])
                 masked_q_values = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
@@ -221,14 +221,14 @@ class DQNAgent:
                 
                 # q_sa 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
                 q_sa = tf.where(tf.math.is_finite(q_sa), q_sa, tf.zeros_like(q_sa))
-                q_sa = tf.clip_by_value(q_sa, -10.0, 10.0)
+                q_sa = tf.clip_by_value(q_sa, -5.0, 5.0)
 
                 # Huber Loss 계산 (MSE보다 안정적)
                 diff = targets - q_sa
                 diff = tf.where(tf.math.is_finite(diff), diff, tf.zeros_like(diff))
                 
                 # Huber Loss: 작은 오차에는 MSE, 큰 오차에는 MAE
-                huber_delta = 1.0  # 임계값
+                huber_delta = 0.5  # 임계값 (더 작게 조정)
                 abs_diff = tf.abs(diff)
                 is_small_error = abs_diff <= huber_delta
                 
@@ -236,7 +236,10 @@ class DQNAgent:
                 large_error_loss = huber_delta * abs_diff - 0.5 * huber_delta * huber_delta
                 
                 huber_loss = tf.where(is_small_error, small_error_loss, large_error_loss)
-                loss = tf.reduce_mean(huber_loss)
+                raw_loss = tf.reduce_mean(huber_loss)
+                
+                # Loss 스케일링 (0.1배로 감소)
+                loss = raw_loss * 0.1
                 
                 # Loss NaN 체크
                 if tf.math.is_nan(loss):

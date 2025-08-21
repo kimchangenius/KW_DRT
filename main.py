@@ -47,7 +47,7 @@ def log_episode(path, info):
             f.write(f"DRT{i + 1}: {route_str}\n")
 
 
-def log_all_episodes(path, info_list):
+def log_all_episodes(path, info_list, total_time):
     filename = 'episodes.csv'
     filepath = os.path.join(path, filename)
     with open(filepath, mode='w', newline='') as csvfile:
@@ -66,6 +66,22 @@ def log_all_episodes(path, info_list):
                 f"{e['mean_detour_time']:.2f}"
             ]
             writer.writerow(curr_row)
+    filename = 'episodes_time.txt'
+    filepath = os.path.join(path, filename)
+    with open(filepath, 'w') as f:
+        # 총 실행 시간 포맷팅 (파일 저장용)
+        if total_time < 60:
+            time_str = f"{total_time:.2f}초"
+        elif total_time < 3600:
+            minutes = int(total_time // 60)
+            seconds = total_time % 60
+            time_str = f"{minutes}분 {seconds:.2f}초"
+        else:
+            hours = int(total_time // 3600)
+            minutes = int((total_time % 3600) // 60)
+            seconds = total_time % 60
+            time_str = f"{hours}시간 {minutes}분 {seconds:.2f}초"
+        f.write(f"Total Time: {time_str}")
 
 
 def get_run_folder_name(config):
@@ -75,8 +91,8 @@ def get_run_folder_name(config):
     return f"hd{hd}_bs{bs}_lr{lr}"
 
 
-def train_ppo(env_builder, config, write_result=False):
-    episodes = 500
+def train_ppo(env_builder, config, write_result=False, load_model=False):
+    episodes = 20
     final_train_steps = 5
 
     config_str = ", ".join(f"{k}={v}" for k, v in config.items())
@@ -98,16 +114,18 @@ def train_ppo(env_builder, config, write_result=False):
     agent = PPOAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
     
     # 기존 모델 로드 시도
-    ppo_config = config.copy()
-    ppo_config["learning_rate"] = config["ppo_learning_rate"]
-    model_name = "{}.h5".format(get_run_folder_name(ppo_config))
-    model_path = os.path.join(RESULT_PATH, model_name)
-    agent.load_model(model_path)
+    if load_model is True:
+        ppo_config = config.copy()
+        ppo_config["learning_rate"] = config["ppo_learning_rate"]
+        model_name = "{}.h5".format(get_run_folder_name(ppo_config))
+        model_path = os.path.join(RESULT_PATH, model_name)
+        agent.load_model(model_path)
 
     transition_id = 0
     e_info_list = []
     best_reward = float('-inf')
-
+    total_time = 0.0
+    
     for ep in range(1, episodes + 1):
         total_loss = 0.0
         total_reward = 0.0
@@ -299,9 +317,16 @@ def train_ppo(env_builder, config, write_result=False):
                     }
                     req_info_list.append(r_info)
                     req_info_list.sort(key=lambda x: x['id'])
-                mean_waiting_time = total_waiting_time / served_count
-                mean_in_vehicle_time = total_in_vehicle_time / served_count
-                mean_detour_time = total_detour_time / served_count
+                    
+                # ZeroDivisionError 방지
+                if served_count > 0:
+                    mean_waiting_time = total_waiting_time / served_count
+                    mean_in_vehicle_time = total_in_vehicle_time / served_count
+                    mean_detour_time = total_detour_time / served_count
+                else:
+                    mean_waiting_time = 0.0
+                    mean_in_vehicle_time = 0.0
+                    mean_detour_time = 0.0
 
                 print('====== Ep: {} / Reward: {} / Loss: {} ======'.format(ep, total_reward, total_loss))
                 e_info = {
@@ -338,14 +363,29 @@ def train_ppo(env_builder, config, write_result=False):
             state = env.state
 
         end_time = time.time()
-        print(f"실행 시간: {end_time - start_time:.6f}초")
+        progress_time = end_time - start_time
+        total_time += progress_time
+        print(f"실행 시간: {progress_time:.6f}초")
+
+    # 총 실행 시간
+    if total_time < 60:
+        print(f"총 실행 시간: {total_time:.6f}초")
+    elif total_time < 3600:
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"총 실행 시간: {minutes}분 {seconds:.6f}초")
+    else:
+        hours = int(total_time // 3600)
+        minutes = int((total_time % 3600) // 60)
+        seconds = total_time % 60
+        print(f"총 실행 시간: {hours}시간 {minutes}분 {seconds:.6f}초")
 
     if write_result is True:
-        log_all_episodes(run_path, e_info_list)
+        log_all_episodes(run_path, e_info_list, total_time)
 
 
-def train_ddqn(env_builder, config, write_result=False):
-    episodes = 5
+def train_ddqn(env_builder, config, write_result=False, load_model=False):
+    episodes = 100
     update_freq = 10
     final_train_steps = 5
 
@@ -369,15 +409,17 @@ def train_ddqn(env_builder, config, write_result=False):
     
     # 기존 모델 로드 시도
     # DQN 전용 config 생성 (dqn_learning_rate를 learning_rate로 변환)
-    dqn_config = config.copy()
-    dqn_config["learning_rate"] = config["dqn_learning_rate"]
-    model_name = "{}.h5".format(get_run_folder_name(dqn_config))
-    model_path = os.path.join(RESULT_PATH, model_name)
-    agent.load_model(model_path)
+    if load_model is True:
+        dqn_config = config.copy()
+        dqn_config["learning_rate"] = config["dqn_learning_rate"]
+        model_name = "{}.h5".format(get_run_folder_name(dqn_config))
+        model_path = os.path.join(RESULT_PATH, model_name)
+        agent.load_model(model_path)
 
     transition_id = 0
     e_info_list = []
     best_reward = float('-inf')
+    total_time = 0.0
 
     for ep in range(1, episodes + 1):
         # print('\n============ Ep : {} ============'.format(ep))
@@ -560,9 +602,16 @@ def train_ddqn(env_builder, config, write_result=False):
                     }
                     req_info_list.append(r_info)
                     req_info_list.sort(key=lambda x: x['id'])
-                mean_waiting_time = total_waiting_time / served_count
-                mean_in_vehicle_time = total_in_vehicle_time / served_count
-                mean_detour_time = total_detour_time / served_count
+                    
+                # ZeroDivisionError 방지
+                if served_count > 0:
+                    mean_waiting_time = total_waiting_time / served_count
+                    mean_in_vehicle_time = total_in_vehicle_time / served_count
+                    mean_detour_time = total_detour_time / served_count
+                else:
+                    mean_waiting_time = 0.0
+                    mean_in_vehicle_time = 0.0
+                    mean_detour_time = 0.0
 
                 print('====== Ep: {} / Reward: {} / Loss: {} / eps: {} ======'.format(ep, total_reward, total_loss, agent.epsilon))
                 e_info = {
@@ -599,12 +648,27 @@ def train_ddqn(env_builder, config, write_result=False):
             state = env.state
 
         end_time = time.time()
-        print(f"실행 시간: {end_time - start_time:.6f}초")
+        progress_time = end_time - start_time
+        total_time += progress_time
+        print(f"실행 시간: {progress_time:.6f}초")
 
         agent.decay_epsilon()
+    
+    # 총 실행 시간
+    if total_time < 60:
+        print(f"총 실행 시간: {total_time:.6f}초")
+    elif total_time < 3600:
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"총 실행 시간: {minutes}분 {seconds:.6f}초")
+    else:
+        hours = int(total_time // 3600)
+        minutes = int((total_time % 3600) // 60)
+        seconds = total_time % 60
+        print(f"총 실행 시간: {hours}시간 {minutes}분 {seconds:.6f}초")
 
     if write_result is True:
-        log_all_episodes(run_path, e_info_list)
+        log_all_episodes(run_path, e_info_list, total_time)
 
 
 def main():
@@ -613,8 +677,8 @@ def main():
     # test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
 
     for params in cfg.config_list:
-        train_ddqn(env_builder, params, write_result=True)
-        # train_ppo(env_builder, params, write_result=True)
+        # train_ddqn(env_builder, params, write_result=True, load_model=False)
+        train_ppo(env_builder, params, write_result=True, load_model=False)
 
 
 if __name__ == "__main__":
