@@ -41,6 +41,9 @@ class RideSharingEnvironment:
         self.done_request_list = []
 
         self.vehicle_list = []
+        
+        # 이벤트 시퀀스 초기화
+        self.event_sequences = [[] for _ in range(cfg.MAX_NUM_VEHICLES)]
 
         self.initialize_vehicles()
         self.handle_time_update()
@@ -137,6 +140,11 @@ class RideSharingEnvironment:
                         r.status = RequestStatus.PICKEDUP
                         r.waiting_time = self.curr_time - r.request_time    # 마지막 확정 업데이트
                         r.pickup_at = self.curr_time                      # 마지막 확정 업데이트
+                        
+                        # 픽업 완료 이벤트 기록
+                        if hasattr(self, 'event_sequences'):
+                            seq = f"P_{r.id}"
+                            self.event_sequences[v.id].append(seq)
 
             if v.status == VehicleStatus.DROPOFF:
                 if v.target_arrival_time == self.curr_time:
@@ -160,7 +168,15 @@ class RideSharingEnvironment:
                         r.arrival_due_left = 0
                     r.in_vehicle_time = self.curr_time - r.pickup_at         # 마지막 확정 업데이트
                     r.dropoff_at = self.curr_time                         # 마지막 확정 업데이트
-                    self.active_request_list.remove(r)
+                    
+                    # 드롭오프 완료 이벤트 기록
+                    if hasattr(self, 'event_sequences'):
+                        seq = f"D_{r.id}"
+                        self.event_sequences[v.id].append(seq)
+                    
+                    # 안전한 요청 제거 (중복 제거 방지)
+                    if r in self.active_request_list:
+                        self.active_request_list.remove(r)
                     self.done_request_list.append(r)
 
                     # Request 완료 보상 (Pickup and Dropoff, 지연 보상)
@@ -335,6 +351,7 @@ class RideSharingEnvironment:
         action[2]['id'] = "{}_{}".format(action[2]['r_id'], action[2]['type'].value)
 
     def step(self, action):
+        """단일 액션 처리 (기존 방식)"""
         # print('Env: Curr action : {}'.format(action))
         vehicle_idx = action[0]
         action_idx = action[1]
@@ -359,6 +376,13 @@ class RideSharingEnvironment:
             # Matching
             # 어떤 요청이 채택된 경우 - Pickup 하러 가거나 Dropoff 하러 가야 함
             r = self.active_request_list[action_idx]
+            
+            # Request 액션은 즉시 완료되므로 여기서 기록
+            if action_idx != cfg.POSSIBLE_ACTION - 1:  # REJECT가 아닌 경우
+                request_id = action[2]['r_id'] if len(action) > 2 and 'r_id' in action[2] else None
+                if request_id:
+                    seq = f"R_{request_id}"  # Request 액션 기록
+                    self.event_sequences[vehicle_idx].append(seq)
 
             if r not in v.active_request_list:
                 # Pickup 하러 가야하는 경우
@@ -450,6 +474,179 @@ class RideSharingEnvironment:
         self.curr_step += 1
 
         return self.state, reward, info
+    
+    def step_multi(self, actions):
+        """여러 액션을 동시에 처리"""
+        total_reward = 0
+        all_info = {
+            'is_pending': False,
+            'has_delayed_reward': False,
+            'action_id_list': [],
+            'reward': 0,
+            'individual_rewards': [],
+            'individual_infos': []
+        }
+        
+        # 각 액션을 개별적으로 처리
+        for action in actions:
+            vehicle_idx = action[0]
+            action_idx = action[1]
+            assert action_idx < cfg.POSSIBLE_ACTION, "Invalid action"
+            
+            reward, info = self.process_single_action(vehicle_idx, action_idx)
+            total_reward += reward
+            all_info['individual_rewards'].append(reward)
+            all_info['individual_infos'].append(info)
+            
+            # Request 액션은 즉시 완료되므로 여기서 기록
+            if action_idx != cfg.POSSIBLE_ACTION - 1:  # REJECT가 아닌 경우
+                request_id = action[2]['r_id'] if len(action) > 2 and 'r_id' in action[2] else None
+                if request_id:
+                    seq = f"R_{request_id}"  # Request 액션 기록
+                    self.event_sequences[vehicle_idx].append(seq)
+            
+            # 지연 보상 정보 수집
+            if info['has_delayed_reward']:
+                all_info['has_delayed_reward'] = True
+                if all_info['action_id_list'] is None:
+                    all_info['action_id_list'] = []
+                all_info['action_id_list'].extend(info['action_id_list'])
+            
+            # Pending 정보 수집
+            if info['is_pending']:
+                all_info['is_pending'] = True
+        
+        all_info['reward'] = total_reward
+        
+        # 상태 동기화 및 스텝 카운터 증가
+        self.sync_state()
+        self.curr_step += 1
+        
+        return self.state, total_reward, all_info
+    
+    def process_single_action(self, vehicle_idx, action_idx):
+        """단일 액션 처리 (내부 메서드)"""
+        reward = 0
+        info = {
+            'is_pending': False,
+            'has_delayed_reward': False,
+            'action_id_list': None,
+            'reward': None
+        }
+        v = self.vehicle_list[vehicle_idx]
+
+        if action_idx == cfg.POSSIBLE_ACTION - 1:
+            # Reject
+            v.status = VehicleStatus.REJECT
+
+            # Logging
+            v.idle_time += 1
+        else:
+            # Matching
+            # 어떤 요청이 채택된 경우 - Pickup 하러 가거나 Dropoff 하러 가야 함
+            # IndexError 방지: action_idx가 유효한 범위인지 확인
+            if action_idx >= len(self.active_request_list):
+                # 요청이 이미 처리되어 제거된 경우
+                reward = 0
+                info['is_pending'] = False
+                return reward, info
+            
+            r = self.active_request_list[action_idx]
+            
+            # 요청이 이미 처리된 경우 체크
+            if r.status in [RequestStatus.SERVED, RequestStatus.CANCELLED]:
+                # 이미 처리된 요청인 경우
+                reward = 0
+                info['is_pending'] = False
+                return reward, info
+
+            if r not in v.active_request_list:
+                # Pickup 하러 가야하는 경우
+                info['is_pending'] = True
+                v.status = VehicleStatus.PICKUP
+                v.active_request_list.append(r)
+                v.next_node = r.from_node_id
+                v.target_request = r
+                pickup_duration = self.network.get_duration(v.curr_node, v.next_node)
+                v.target_arrival_time = self.curr_time + pickup_duration
+
+                r.status = RequestStatus.ACCEPTED
+                r.assigned_v_id = v.id
+
+                # Pickup 결정 보상 (최대 1점, 즉시 보상)
+                reward = 0.5 * (1 - pickup_duration / self.network.max_duration)
+                + 0.5 * (1 - r.waiting_time / cfg.MAX_WAIT_TIME)
+
+                # Logging
+                v.num_accept += 1
+
+                # 만약 Pickup이 즉시 완료된다면
+                if v.curr_node == v.next_node:
+                    v.status = VehicleStatus.IDLE
+                    v.next_node = 0
+                    v.target_request = None
+                    v.target_arrival_time = -1
+                    v.num_passengers += r.num_passengers
+                    assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
+
+                    r.status = RequestStatus.PICKEDUP
+                    r.waiting_time = self.curr_time - r.request_time  # 마지막 확정 업데이트
+                    r.pickup_at = self.curr_time  # 마지막 확정 업데이트
+
+                    # Pickup 결정 즉시 완료 보상
+                    reward += 1
+                    info['is_pending'] = False
+
+            else:
+                # Dropoff 하러 가야하는 경우
+                info['is_pending'] = True
+                v.status = VehicleStatus.DROPOFF
+                v.next_node = r.to_node_id
+                v.target_request = r
+                dropoff_duration = self.network.get_duration(v.curr_node, v.next_node)
+                v.target_arrival_time = self.curr_time + dropoff_duration
+
+                # Dropoff 결정 리워드 (즉시 보상)
+                in_vehicle_ratio = r.in_vehicle_time / cfg.MAX_INVEHICLE_TIME
+                if in_vehicle_ratio > 1:
+                    in_vehicle_ratio = 1
+                reward = 0.5 * (1 - dropoff_duration / self.network.max_duration)
+                + 0.5 * (1 - in_vehicle_ratio)
+
+                # 만약 Dropoff가 즉시 완료된다면
+                if v.curr_node == v.next_node:
+                    v.status = VehicleStatus.IDLE
+                    v.next_node = 0
+                    v.target_request = None
+                    v.target_arrival_time = -1
+                    v.active_request_list.remove(r)
+                    v.num_passengers -= r.num_passengers
+                    assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
+
+                    r.status = RequestStatus.SERVED
+                    r.arrival_due_left = r.arrival_due - self.curr_time     # 마지막 확정 업데이트
+                    r.in_vehicle_time = self.curr_time - r.pickup_at      # 마지막 확정 업데이트
+                    r.dropoff_at = self.curr_time                         # 마지막 확정 업데이트
+                    self.active_request_list.remove(r)
+                    self.done_request_list.append(r)
+
+                    # Dropoff 결정 즉시 완료 보상
+                    reward += 1
+
+                    # Request 완료 보상 (Dropoff, 즉시 보상)
+                    reward += 0.5
+                    info['is_pending'] = False
+
+                    # Request 완료 보상 (Pickup, 지연 보상)
+                    info['has_delayed_reward'] = True
+                    action_id = "{}_1".format(r.id)
+                    info['action_id_list'] = [action_id]
+                    info['reward'] = 0.5
+
+                    # Logging
+                    v.num_serve += 1
+
+        return reward, info
 
     def has_idle_vehicle(self):
         has = False

@@ -161,7 +161,6 @@ class PPOAgent:
         return action_probs, logits
         
     def act(self, state, action_mask):
-        """액션 선택 - DQN과 유사한 안전한 방식"""
         action_probs, logits = self.get_action_probs(state, action_mask)
         
         # 유효한 액션들의 인덱스 찾기 
@@ -395,20 +394,9 @@ class PPOAgent:
                 action_indices = tf.stack([batch_indices, actions[:, 0], actions[:, 1]], axis=1)
                 new_action_probs = tf.gather_nd(action_probs, action_indices)
                 
-                # Ratio 계산
-                ratio = new_action_probs / (old_action_probs + 1e-8)
-                
-                # KL divergence 계산 (수치적 안정성 강화)
-                old_probs_safe = tf.clip_by_value(old_action_probs, 1e-8, 1.0)
-                new_probs_safe = tf.clip_by_value(new_action_probs, 1e-8, 1.0)
-                
-                # print(f"[Debug] Epoch {epoch}: old_probs range={tf.reduce_min(old_probs_safe):.6f}~{tf.reduce_max(old_probs_safe):.6f}")
-                # print(f"[Debug] Epoch {epoch}: new_probs range={tf.reduce_min(new_probs_safe):.6f}~{tf.reduce_max(new_probs_safe):.6f}")
-                
-                log_ratio = tf.math.log(old_probs_safe / new_probs_safe)
-                # print(f"[Debug] Epoch {epoch}: log_ratio has_inf={tf.reduce_any(tf.math.is_inf(log_ratio))}, has_nan={tf.reduce_any(tf.math.is_nan(log_ratio))}")
-                
-                kl_div = tf.reduce_mean(old_probs_safe * log_ratio)
+                # Ratio 계산 - 안전한 방식
+                ratio = new_action_probs / tf.maximum(old_action_probs, 1e-8)
+                ratio = tf.clip_by_value(ratio, 0.1, 10.0)  # 극값 클리핑
                 
                 # Clipped surrogate objective
                 surr1 = ratio * advantages
@@ -418,7 +406,7 @@ class PPOAgent:
                 entropy = -tf.reduce_sum(action_probs * tf.math.log(action_probs + 1e-8), axis=-1)
                 entropy = tf.reduce_mean(entropy)
                 
-                # Actor loss
+                # Actor loss (KL Divergence 제거)
                 actor_loss = -tf.reduce_mean(tf.minimum(surr1, surr2)) - self.entropy_coef * entropy
                 
                 # Actor loss NaN 체크
@@ -463,19 +451,12 @@ class PPOAgent:
             # else:
             #     print(f"[Warning] Skipping NaN critic loss at epoch {epoch}")
             
-            # KL divergence가 너무 크면 중단
-            if kl_div.numpy() > self.target_kl:
-                # print(f"Early stopping at epoch {epoch+1}, KL div: {kl_div.numpy():.6f}")
-                break
-            
-        # 적응적 learning rate 조정 (비활성화 - 안정성 우선)
-        final_kl_div = kl_div.numpy()
-        # self.update_learning_rate(final_kl_div)  # 적응적 학습률 비활성화
+            # KL Divergence Early Stopping 제거 (클리핑만으로 제어)
         
         # 버퍼 정리
         self.trajectory_buffer = []
         
-        return (total_actor_loss / 4, total_critic_loss / 4, final_kl_div)
+        return (total_actor_loss / 4, total_critic_loss / 4)
         
     def reset_learning_rate(self):
         """Learning rate를 초기값으로 리셋"""

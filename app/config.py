@@ -1,8 +1,8 @@
 import itertools
 
-MAX_NUM_VEHICLES = 2
+MAX_NUM_VEHICLES = 5
 
-MAX_NUM_REQUEST = 8
+MAX_NUM_REQUEST = 12
 VEH_CAPACITY = 5
 MAX_WAIT_TIME = 10
 MAX_INVEHICLE_TIME = 10
@@ -21,7 +21,8 @@ param_grid = {
     # "learning_rate": [1e-4, 1e-5, 1e-6]
     "learning_rate": [1e-5],  # 기본값 
     "ppo_learning_rate": [1e-6],
-    "dqn_learning_rate": [1e-7]
+    "dqn_learning_rate": [1e-7],
+    "mappo_learning_rate": [3e-4]  # MAPPO learning rate 추가
 }
 
 keys = list(param_grid.keys())

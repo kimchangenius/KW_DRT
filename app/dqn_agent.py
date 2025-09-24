@@ -73,58 +73,47 @@ class DQNAgent:
 
         # Concatenate along request dim → total 21 actions
         q_total = Concatenate(axis=-1)([q_match, q_reject])  # (B, V, R+1)
-        
-        # Q-값 범위 제한 (tanh로 -5~5 범위로 스케일링)
-        q_scaled = Lambda(lambda x: 5.0 * tf.tanh(x))(q_total)  # (-5, 5) 범위
+
+        # Output scaling to bound Q-values and prevent explosion
+        q_scaled = Lambda(lambda x: 5.0 * tf.tanh(x))(q_total)  # (-5, 5)
 
         return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_scaled)
 
     def act(self, state, action_mask):
         info = {
-            'mode': None # 실제 사용 x, env.enrich_action에서 덮어짐.
+            'mode': None
         }
-        
         # 유효한 액션 먼저 확인
         valid_actions = tf.where(action_mask == 1)
-        
         if tf.shape(valid_actions)[0] == 0:
-            # 유효한 액션이 없는 경우 REJECT 선택
+            # 유효한 액션이 없는 경우 REJECT로 폴백
             vehicle_idx = 0
-            action_idx = cfg.POSSIBLE_ACTION - 1  # REJECT
+            action_idx = cfg.POSSIBLE_ACTION - 1
             info['mode'] = 'fallback'
-        elif np.random.rand() < self.epsilon:
-            # 탐험: 유효한 액션 중에서 랜덤 선택
+            return [vehicle_idx, action_idx, info]
+
+        if np.random.rand() < self.epsilon:
             info['mode'] = 'explore'
             rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
-            rand_action = valid_actions[rand_idx]
-            rand_action = rand_action.numpy()
+            rand_action = valid_actions[rand_idx].numpy()
             vehicle_idx = int(rand_action[0])
             action_idx = int(rand_action[1])
         else:
-            # 활용: Q-값 기반 선택 (안전한 마스킹)
             info['mode'] = 'exploit'
             q_values = self.model.predict(state, verbose=0)
-            
-            # 더 안전한 마스킹: 무효한 액션에 매우 작은 값 할당
+            # 무효 액션에 작은 값 할당(너무 큰 음수는 불필요한 수치문제 유발)
             masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
-            
-            # 전체에서 argmax 후 유효성 재검증
-            flat_masked_q = tf.reshape(masked_q, (-1,))
-            flat_idx = tf.argmax(flat_masked_q).numpy()
-            
+            flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
             vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
             action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
-            
-            # 선택된 액션이 실제로 유효한지 최종 확인
+            # 최종 유효성 재검증
             if action_mask[vehicle_idx][action_idx] != 1:
-                # 무효한 액션이 선택된 경우 유효한 액션 중 첫 번째로 대체
                 first_valid = valid_actions[0].numpy()
                 vehicle_idx = int(first_valid[0])
                 action_idx = int(first_valid[1])
                 info['mode'] = 'exploit_safe_fallback'
-                
         return [vehicle_idx, action_idx, info]
-        
+
     def decay_epsilon(self):
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -138,7 +127,7 @@ class DQNAgent:
         action = transition[1]
         action_id = action[2]['id']
         self.pending_buffer.add(action_id, transition)
-        
+
     def confirm_and_remember(self, action_id, reward):
         transition = self.pending_buffer.confirm(action_id, reward)
         if transition is not None:
@@ -149,122 +138,100 @@ class DQNAgent:
             return None
 
         try:
-            # print("\n\n================= Train : {} =================".format(self.train_step))
             batch = self.replay_buffer.sample(self.batch_size)
 
             # === Q(s', a') with numerical stability ===
             next_vehicle_tensor = np.array([b[3][0][0] for b in batch])
             next_request_tensor = np.array([b[3][1][0] for b in batch])
             next_relation_tensor = np.array([b[3][2][0] for b in batch])
-            
-            # NaN/Inf 체크 및 정리 (보상 범위에 맞는 클리핑)
+
+            # Clean inputs
             next_vehicle_tensor = np.nan_to_num(next_vehicle_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
             next_request_tensor = np.nan_to_num(next_request_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
             next_relation_tensor = np.nan_to_num(next_relation_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
-            
+
             next_states = [next_vehicle_tensor, next_request_tensor, next_relation_tensor]
 
-            next_q_values = self.target_model.predict(next_states, verbose=0)  # (B, V, A)
-            
-            # Q-값 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
+            next_q_values = self.target_model.predict(next_states, verbose=0)
             next_q_values = tf.where(tf.math.is_finite(next_q_values), next_q_values, tf.zeros_like(next_q_values))
             next_q_values = tf.clip_by_value(next_q_values, -5.0, 5.0)
-            
+
             next_action_mask = np.array([b[5]['nm'] for b in batch])
             masked_next_q_values = tf.where(next_action_mask == 1, next_q_values, tf.constant(-1e1, dtype=tf.float32))
             max_next_q = np.max(masked_next_q_values, axis=(1, 2))
-            
-            # max_next_q 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
             max_next_q = np.nan_to_num(max_next_q, nan=0.0, posinf=5.0, neginf=-5.0)
             max_next_q = np.clip(max_next_q, -5.0, 5.0)
 
             rewards = np.array([b[2] for b in batch], dtype=np.float32)
             dones = np.array([b[4] for b in batch], dtype=np.float32)
-            
-            # Rewards와 dones 안정성 보장 (실제 보상 범위 유지)
             rewards = np.nan_to_num(rewards, nan=0.0, posinf=5.0, neginf=-5.0)
             rewards = np.clip(rewards, -5.0, 5.0)
-            
+
             targets = rewards + self.gamma * max_next_q * (1 - dones)
             targets = np.nan_to_num(targets, nan=0.0, posinf=5.0, neginf=-5.0)
             targets = np.clip(targets, -5.0, 5.0)
 
             # === Q(s, a) with numerical stability ===
-            vehicle_tensor = np.array([b[0][0][0] for b in batch])  # (B, V, Dv)
-            request_tensor = np.array([b[0][1][0] for b in batch])  # (B, R, Dr)
-            relation_tensor = np.array([b[0][2][0] for b in batch])  # (B, V, R, Drel)
-            
-            # 입력 텐서 안정성 보장
+            vehicle_tensor = np.array([b[0][0][0] for b in batch])
+            request_tensor = np.array([b[0][1][0] for b in batch])
+            relation_tensor = np.array([b[0][2][0] for b in batch])
+
             vehicle_tensor = np.nan_to_num(vehicle_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
             request_tensor = np.nan_to_num(request_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
             relation_tensor = np.nan_to_num(relation_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
-            
+
             states = [vehicle_tensor, request_tensor, relation_tensor]
 
             with tf.GradientTape() as tape:
                 q_values = self.model(states, training=True)
-                
-                # Q-값 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
                 q_values = tf.where(tf.math.is_finite(q_values), q_values, tf.zeros_like(q_values))
                 q_values = tf.clip_by_value(q_values, -5.0, 5.0)
-                
+
                 action_mask = np.array([b[5]['m'] for b in batch])
                 masked_q_values = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
 
-                actions_raw = np.array([b[1] for b in batch])  # (B, 3)
-                actions = actions_raw[:, :2]  # (B, 2)
-                indices = tf.constant(actions, dtype=tf.int32)  # (B, 2)
-                batch_indices = tf.range(tf.shape(indices)[0], dtype=tf.int32)[:, tf.newaxis]  # (B, 1)
-                full_indices = tf.concat([batch_indices, indices], axis=1)  # (B, 3)
+                actions_raw = np.array([b[1] for b in batch])
+                actions = actions_raw[:, :2]
+                indices = tf.constant(actions, dtype=tf.int32)
+                batch_indices = tf.range(tf.shape(indices)[0], dtype=tf.int32)[:, tf.newaxis]
+                full_indices = tf.concat([batch_indices, indices], axis=1)
 
-                q_sa = tf.gather_nd(masked_q_values, full_indices)  # (B,)
-                
-                # q_sa 안정성 보장 (보상 범위에 맞는 강력한 클리핑)
+                q_sa = tf.gather_nd(masked_q_values, full_indices)
                 q_sa = tf.where(tf.math.is_finite(q_sa), q_sa, tf.zeros_like(q_sa))
                 q_sa = tf.clip_by_value(q_sa, -5.0, 5.0)
 
-                # Huber Loss 계산 (MSE보다 안정적)
-                diff = targets - q_sa
-                diff = tf.where(tf.math.is_finite(diff), diff, tf.zeros_like(diff))
-                
-                # Huber Loss: 작은 오차에는 MSE, 큰 오차에는 MAE
-                huber_delta = 0.5  # 임계값 (더 작게 조정)
+                # Huber loss (more robust than MSE)
+                diff = targets - q_sa.numpy()
+                diff = np.nan_to_num(diff, nan=0.0, posinf=5.0, neginf=-5.0)
+                diff = np.clip(diff, -10.0, 10.0)
+                diff = tf.convert_to_tensor(diff, dtype=tf.float32)
+
+                huber_delta = 0.5
                 abs_diff = tf.abs(diff)
-                is_small_error = abs_diff <= huber_delta
-                
-                small_error_loss = 0.5 * tf.square(diff)
-                large_error_loss = huber_delta * abs_diff - 0.5 * huber_delta * huber_delta
-                
-                huber_loss = tf.where(is_small_error, small_error_loss, large_error_loss)
+                is_small = abs_diff <= huber_delta
+                small_loss = 0.5 * tf.square(diff)
+                large_loss = huber_delta * abs_diff - 0.5 * huber_delta * huber_delta
+                huber_loss = tf.where(is_small, small_loss, large_loss)
                 raw_loss = tf.reduce_mean(huber_loss)
-                
-                # Loss 스케일링 (0.1배로 감소)
-                loss = raw_loss * 0.1
-                
-                # Loss NaN 체크
+                loss = raw_loss * 0.1  # scale down
+
                 if tf.math.is_nan(loss):
-                    print("[Warning] Loss is NaN! Setting to 0.")
+                    print("[Warning] Loss is NaN! Forcing 0.0")
                     return 0.0
 
-            # Gradients 계산 및 안정성 보장
             grads = tape.gradient(loss, self.model.trainable_variables)
             if grads is not None:
-                # 그래디언트 NaN/Inf 체크 및 클리핑
                 safe_grads = []
                 for grad in grads:
                     if grad is not None:
-                        # NaN/Inf를 0으로 대체
-                        safe_grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
-                        # 그래디언트 노름 클리핑
-                        safe_grad = tf.clip_by_norm(safe_grad, 1.0)
-                        safe_grads.append(safe_grad)
+                        g = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+                        g = tf.clip_by_norm(g, 1.0)
+                        safe_grads.append(g)
                     else:
                         safe_grads.append(None)
-                
-                # 안전한 그래디언트만 적용
-                valid_grads_and_vars = [(g, v) for g, v in zip(safe_grads, self.model.trainable_variables) if g is not None]
-                if valid_grads_and_vars:
-                    self.optimizer.apply_gradients(valid_grads_and_vars)
+                pairs = [(g, v) for g, v in zip(safe_grads, self.model.trainable_variables) if g is not None]
+                if pairs:
+                    self.optimizer.apply_gradients(pairs)
 
             self.train_step += 1
             if self.train_step % self.update_target_freq == 0:
