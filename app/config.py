@@ -6,6 +6,12 @@ MAX_NUM_REQUEST = 12
 VEH_CAPACITY = 5
 MAX_WAIT_TIME = 10
 MAX_INVEHICLE_TIME = 10
+MAX_ACCEPT_WAIT = 6  # ACCEPTED 상태 후 픽업까지 허용하는 최대 대기시간(강화된 타임아웃)
+
+# 세이프가드 토글/파라미터
+ENABLE_SAFEGUARD = True
+STAGNATION_WINDOW = 50
+MAX_STEPS_CAP = 500
 
 VEHICLE_INPUT_DIM = 53
 REQUEST_INPUT_DIM = 55
@@ -21,7 +27,7 @@ param_grid = {
     # "learning_rate": [1e-4, 1e-5, 1e-6]
     "learning_rate": [1e-5],  # 기본값 
     "ppo_learning_rate": [1e-6],
-    "dqn_learning_rate": [1e-7],
+    "dqn_learning_rate": [1e-4],  # 더 공격적인 learning rate
     "mappo_learning_rate": [3e-4]  # MAPPO learning rate 추가
 }
 

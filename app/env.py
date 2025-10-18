@@ -125,8 +125,9 @@ class RideSharingEnvironment:
                     v.target_arrival_time = -1
 
                     if r.status == RequestStatus.CANCELLED:
-                        # Pickup 실패
-                        v.active_request_list.remove(r)
+                        # Pickup 실패 - 안전한 제거
+                        if r in v.active_request_list:
+                            v.active_request_list.remove(r)
 
                         # Cancel 페널티 (Pickup 결정, 지연 보상(페널티))
                         p_action_id = "{}_1".format(r.id)
@@ -197,16 +198,42 @@ class RideSharingEnvironment:
             if r.status == RequestStatus.PENDING or r.status == RequestStatus.ACCEPTED:
                 r.waiting_time = self.curr_time - r.request_time
 
-                # waiting_time 초과 확인
-                if r.waiting_time >= cfg.MAX_WAIT_TIME:
+                # waiting_time 초과 확인 (PENDING)
+                if r.status == RequestStatus.PENDING and r.waiting_time >= cfg.MAX_WAIT_TIME:
                     r.status = RequestStatus.CANCELLED
                     cancelled_list.append(r)
+
+                # ACCEPTED 후 픽업까지의 강력 타임아웃
+                # 차량에 assign되었지만 실제 PICKEDUP으로 전환되지 못하는 요청을 강제로 취소
+                if r.status == RequestStatus.ACCEPTED:
+                    # assign 이후 경과 시간 계산
+                    if getattr(r, 'accepted_at', None) is None:
+                        # 최초 ACCEPT 기록이 없으면 지금 시각으로 초기화
+                        r.accepted_at = self.curr_time
+                    accepted_elapsed = self.curr_time - r.accepted_at
+                    if accepted_elapsed >= cfg.MAX_ACCEPT_WAIT:
+                        r.status = RequestStatus.CANCELLED
+                        cancelled_list.append(r)
             if r.status == RequestStatus.PICKEDUP:
                 r.in_vehicle_time = self.curr_time - r.pickup_at
 
         for cr in cancelled_list:
             self.active_request_list.remove(cr)
             self.done_request_list.append(cr)
+
+        # 취소된 요청이 차량 active 리스트에 남아있다면 안전하게 제거하고 지연보상 부여
+        if len(cancelled_list) > 0:
+            for v in self.vehicle_list:
+                to_remove = []
+                for r in v.active_request_list:
+                    if r.status == RequestStatus.CANCELLED:
+                        to_remove.append(r)
+                        # Pickup 실패 지연보상 부여
+                        p_action_id = "{}_1".format(r.id)
+                        d_reward_list.append([p_action_id, -1])
+                for r in to_remove:
+                    if r in v.active_request_list:
+                        v.active_request_list.remove(r)
 
         for idx, r in enumerate(self.active_request_list):
             r.slot_idx = idx
@@ -315,7 +342,13 @@ class RideSharingEnvironment:
                     else:
                         v_row.append(0)
                 elif r.status == RequestStatus.PENDING:
-                    v_empty_seat = cfg.VEH_CAPACITY - v.num_passengers
+                    # 현재 승객 수 + 이미 수락한 요청들의 승객 수 계산
+                    future_passengers = v.num_passengers
+                    for pending_r in v.active_request_list:
+                        if pending_r.status == RequestStatus.ACCEPTED:
+                            future_passengers += pending_r.num_passengers
+                    
+                    v_empty_seat = cfg.VEH_CAPACITY - future_passengers
                     if v_empty_seat >= r.num_passengers:
                         v_row.append(1)
                     else:
@@ -562,6 +595,13 @@ class RideSharingEnvironment:
 
             if r not in v.active_request_list:
                 # Pickup 하러 가야하는 경우
+                # 용량 체크: 승객을 태울 수 있는지 확인
+                if v.num_passengers + r.num_passengers > cfg.VEH_CAPACITY:
+                    # 용량 초과 - 이 액션은 무효
+                    reward = 0
+                    info['is_pending'] = False
+                    return reward, info
+                
                 info['is_pending'] = True
                 v.status = VehicleStatus.PICKUP
                 v.active_request_list.append(r)
@@ -656,9 +696,32 @@ class RideSharingEnvironment:
         return has
 
     def is_done(self):
+        # 기본 종료 조건: 모든 요청이 처리됨
         if len(self.active_request_list) == 0 and len(self.future_request_list) == 0:
             # for v in self.vehicle_list:
             #     if v.status != VehicleStatus.IDLE:
             #         return False
             return True
+        
+        # 추가 종료 조건들 (DDQN을 위한 관대한 종료)
+        
+        # 1. 요청이 거의 처리되지 않고 시간이 많이 지난 경우
+        # 근거: 정상적인 시뮬레이션은 60-80시간 내에 완료되므로, 80시간 후에도 5개 미만 처리되면 비효율적
+        # if self.curr_time > 80 and len(self.done_request_list) < 5:
+        #     return True
+        
+        # # 2. 활성 요청이 많지만 처리되지 않는 경우 (DDQN이 모든 요청을 거부할 때)
+        # # 근거: 활성 요청이 15개 이상이고 평균 대기시간이 MAX_WAIT_TIME의 80% 이상이면 비효율적
+        # if len(self.active_request_list) > 15 and self.curr_time > 40:
+        #     avg_waiting_time = sum(r.waiting_time for r in self.active_request_list) / len(self.active_request_list)
+        #     max_wait_threshold = cfg.MAX_WAIT_TIME * 0.8  # MAX_WAIT_TIME의 80%
+        #     if avg_waiting_time > max_wait_threshold:
+        #         return True
+        
+        # # 3. 모든 차량이 IDLE이고 요청이 있지만 처리되지 않는 경우
+        # # 근거: 차량들이 일하지 않고 있는데 처리할 요청이 있다면 시스템이 멈춘 상태
+        # all_idle = all(v.status == VehicleStatus.IDLE for v in self.vehicle_list)
+        # if all_idle and len(self.active_request_list) > 0 and self.curr_time > 25:
+        #     return True
+        
         return False

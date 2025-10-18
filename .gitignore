@@ -7,3 +7,8 @@ __pycache__/
 .DS_Store
 result/*
 !result/.gitkeep
+train_result/*
+!train_result/.gitkeep
+trash/*
+!trash/.gitkeep
+tuning.txt

@@ -2,7 +2,7 @@ import random
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=10000):
+    def __init__(self, capacity=500):  # 2000 -> 500 (GPU OOM 방지 강화)
         self.buffer = []
         self.capacity = capacity
         self.position = 0

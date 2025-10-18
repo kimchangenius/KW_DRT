@@ -32,7 +32,9 @@ class MAPPOAgent:
         
         # Episode buffer for multi-agent
         self.episode_buffer = []
-        self.update_frequency = 15  # 10 -> 15 (더 큰 배치로 안정성 향상)
+        self.rollout_length = 512  # 표준 MAPPO: 고정 rollout 길이
+        self.num_sgd_epochs = 4  # 같은 배치로 여러 번 학습
+        self.minibatch_size = 128  # Mini-batch 크기
         
         # Build decentralized actor networks (각 에이전트마다 독립적인 actor)
         self.actors = [self.build_actor(agent_id) for agent_id in range(self.num_agents)]
@@ -181,7 +183,7 @@ class MAPPOAgent:
         
         # 액션 마스크 적용 (해당 차량의 마스크만)
         agent_mask = action_masks[agent_id:agent_id+1, :]  # (1, A)
-        masked_logits = tf.where(agent_mask == 1, logits, tf.constant(-5.0, dtype=tf.float32))
+        masked_logits = tf.where(agent_mask == 1, logits, tf.constant(-5.0, dtype=logits.dtype))
         
         # 확률 변환
         clipped_logits = tf.clip_by_value(masked_logits, -5.0, 5.0)
@@ -192,7 +194,7 @@ class MAPPOAgent:
         # 확률 안정화
         action_probs = tf.maximum(action_probs, 1e-6)
         action_probs = action_probs / tf.reduce_sum(action_probs, axis=-1, keepdims=True)
-        action_probs = tf.where(tf.math.is_finite(action_probs), action_probs, tf.constant(1e-6, dtype=tf.float32))
+        action_probs = tf.where(tf.math.is_finite(action_probs), action_probs, tf.constant(1e-6, dtype=action_probs.dtype))
         
         return action_probs, logits
         
@@ -231,7 +233,7 @@ class MAPPOAgent:
                 masked_probs = tf.where(
                     action_mask[vehicle_idx] == 1, 
                     action_probs[0], 
-                    tf.constant(0.0, dtype=tf.float32)
+                    tf.constant(0.0, dtype=logits.dtype)
                 )
                 
                 # 확률이 0이 아닌 액션들만 고려
@@ -428,8 +430,9 @@ class MAPPOAgent:
             self.episode_buffer = []
             
     def should_train(self):
-        """학습을 수행할 조건 확인"""
-        return len(self.trajectory_buffer) >= self.update_frequency
+        """학습을 수행할 조건 확인 - 표준 MAPPO 방식"""
+        # rollout_length만큼 수집되면 학습 시작
+        return len(self.trajectory_buffer) >= self.rollout_length
         
     def update_learning_rate(self, episode):
         """Learning rate 스케줄링"""
@@ -511,11 +514,12 @@ class MAPPOAgent:
         return advantages, returns
         
     def train(self):
-        """MAPPO 학습"""
-        if len(self.trajectory_buffer) < 5:
+        """MAPPO 학습 - 표준 구현"""
+        if len(self.trajectory_buffer) < self.rollout_length:
             return None
-            
-        batch = self.trajectory_buffer[:]
+        
+        # 표준 MAPPO: rollout_length만큼만 사용
+        batch = self.trajectory_buffer[:self.rollout_length]
         
         # 상태, 액션, 보상 등 추출
         states = [
@@ -550,7 +554,8 @@ class MAPPOAgent:
         total_actor_losses = [0.0] * self.num_agents
         total_critic_loss = 0.0
         
-        for epoch in range(4):
+        # 표준 MAPPO: 여러 epoch 반복 학습
+        for epoch in range(self.num_sgd_epochs):
             # 각 에이전트의 Actor 업데이트
             for agent_id in range(self.num_agents):
                 # 해당 에이전트가 행동한 경험만 필터링
@@ -594,7 +599,7 @@ class MAPPOAgent:
                         if tf.size(probs) > 0 and probs_shape[0] > 0 and action_idx < 9:
                             prob_value = probs[0, 0, action_idx]
                         else:
-                            prob_value = tf.constant(0.0, dtype=tf.float32)
+                            prob_value = tf.constant(0.0, dtype=action_probs.dtype)
                             
                         new_action_probs.append(prob_value)
                     
@@ -676,10 +681,10 @@ class MAPPOAgent:
             if not np.isnan(critic_loss_val):
                 total_critic_loss += critic_loss_val
                 
-        # 버퍼 정리
-        self.trajectory_buffer = []
+        # 표준 MAPPO: 학습에 사용한 경험 완전히 제거
+        self.trajectory_buffer = self.trajectory_buffer[self.rollout_length:]
         
         # 평균 actor loss 계산
-        avg_actor_loss = np.mean([loss / 4 for loss in total_actor_losses if loss > 0])
+        avg_actor_loss = np.mean([loss / self.num_sgd_epochs for loss in total_actor_losses if loss > 0])
         
-        return (avg_actor_loss, total_critic_loss / 4)
+        return (avg_actor_loss, total_critic_loss / self.num_sgd_epochs)

@@ -136,8 +136,8 @@ class PPOAgent:
         logits = tf.clip_by_value(logits, -5.0, 5.0)
         # print(f"[Debug] Cleaned logits: min={tf.reduce_min(logits):.6f}, max={tf.reduce_max(logits):.6f}")
         
-        # Apply action mask (더 안전한 값 사용)
-        masked_logits = tf.where(action_mask == 1, logits, tf.constant(-5.0, dtype=tf.float32))
+        # Apply action mask (더 안전한 값 사용) - dtype 일치
+        masked_logits = tf.where(action_mask == 1, logits, tf.constant(-5.0, dtype=logits.dtype))
         
         # Convert to probabilities (대폭 강화된 수치적 안정성)
         # 더 강한 로그잇 클리핑
@@ -155,7 +155,7 @@ class PPOAgent:
         action_probs = action_probs / tf.reduce_sum(action_probs, axis=-1, keepdims=True)
         
         # 최종 확률 체크
-        action_probs = tf.where(tf.math.is_finite(action_probs), action_probs, tf.constant(1e-6, dtype=tf.float32))
+        action_probs = tf.where(tf.math.is_finite(action_probs), action_probs, tf.constant(1e-6, dtype=action_probs.dtype))
         # print(f"[Debug] Final action_probs: min={tf.reduce_min(action_probs):.6f}, max={tf.reduce_max(action_probs):.6f}")
         
         return action_probs, logits
@@ -174,7 +174,7 @@ class PPOAgent:
             action_prob_value = 1.0
         else:
             # 마스킹된 확률 분포에서 샘플링
-            masked_probs = tf.where(action_mask == 1, action_probs, tf.constant(0.0, dtype=tf.float32))
+            masked_probs = tf.where(action_mask == 1, action_probs, tf.constant(0.0, dtype=action_probs.dtype))
             masked_probs_flat = tf.reshape(masked_probs, (-1,))
             
             # 확률이 0이 아닌 액션들만 고려
@@ -206,9 +206,14 @@ class PPOAgent:
                 sampled_idx = tf.random.categorical(tf.math.log(non_zero_probs[tf.newaxis, :]), 1)[0, 0]
                 flat_action_idx = non_zero_indices[sampled_idx]
                 
-                # 차량과 액션 인덱스 계산
-                vehicle_idx = int(flat_action_idx // cfg.POSSIBLE_ACTION)
-                action_idx = int(flat_action_idx % cfg.POSSIBLE_ACTION)
+                # 차량과 액션 인덱스 계산 (GPU 친화적 연산)
+                flat_action_idx_int64 = tf.cast(flat_action_idx, dtype=tf.int64)
+                possible_action_int64 = tf.constant(cfg.POSSIBLE_ACTION, dtype=tf.int64)
+                vehicle_idx_int64 = tf.math.floordiv(flat_action_idx_int64, possible_action_int64)
+                action_idx_int64 = flat_action_idx_int64 - vehicle_idx_int64 * possible_action_int64
+                
+                vehicle_idx = int(vehicle_idx_int64.numpy())
+                action_idx = int(action_idx_int64.numpy())
                 
                 # 해당 액션의 확률
                 action_prob_value = float(action_probs[0][vehicle_idx][action_idx].numpy())
