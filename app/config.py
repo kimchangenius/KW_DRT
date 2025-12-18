@@ -26,7 +26,7 @@ param_grid = {
     "batch_size": [32],
     # "learning_rate": [1e-4, 1e-5, 1e-6]
     "learning_rate": [1e-5],  # 기본값 
-    "ppo_learning_rate": [1e-6],
+    "ppo_learning_rate": [3e-4],
     "dqn_learning_rate": [1e-4],  # 더 공격적인 learning rate
     "mappo_learning_rate": [3e-4]  # MAPPO learning rate 추가
 }

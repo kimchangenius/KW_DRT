@@ -32,7 +32,7 @@ class RideSharingEnvironment:
         # Logging
         self.logs = []
 
-    def reset(self):
+    def reset(self, random_vehicle_positions=False):
         self.curr_time = 0
         self.curr_step = 0
 
@@ -44,6 +44,12 @@ class RideSharingEnvironment:
         
         # 이벤트 시퀀스 초기화
         self.event_sequences = [[] for _ in range(cfg.MAX_NUM_VEHICLES)]
+
+        # 랜덤 차량 위치 설정 (시뮬레이션용)
+        if random_vehicle_positions:
+            # 네트워크의 노드 수를 사용하여 랜덤 위치 생성
+            num_nodes = self.network.num_nodes
+            self.vehicle_init_pos = np.random.randint(1, num_nodes + 1, size=cfg.MAX_NUM_VEHICLES).tolist()
 
         self.initialize_vehicles()
         self.handle_time_update()

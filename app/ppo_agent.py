@@ -12,461 +12,553 @@ class PPOAgent:
     def __init__(self, hidden_dim, batch_size, learning_rate):
         self.hidden_dim = hidden_dim
         self.batch_size = batch_size
-        self.learning_rate = learning_rate
-        
-        # PPO specific hyperparameters (안정화된 설정)
-        self.clip_ratio = 0.15  # 0.2 → 0.15 (더 보수적)
+        self.learning_rate = learning_rate  # critic lr 입력값
+
+        # Learning rates 분리
+        self.actor_learning_rate = 5e-4
+        self.critic_learning_rate = learning_rate
+
+        # PPO hyperparameters
+        self.clip_ratio = 0.13
         self.gamma = 0.99
         self.gae_lambda = 0.95
-        self.entropy_coef = 0.02  # 0.01 → 0.02 (탐험 장려)
-        self.value_coef = 0.5
-        self.max_grad_norm = 0.5  # 1.0 → 0.5 (그래디언트 클리핑 강화)
-        self.target_kl = 0.01  # 0.02 → 0.01 (더 엄격한 KL 제한)
-        
-        # Learning rate scheduling
-        self.initial_learning_rate = learning_rate
-        self.current_learning_rate = learning_rate
-        
-        # PPO는 episode 기반 학습이 더 효과적
-        self.episode_buffer = []  # 현재 에피소드의 transitions
-        self.update_frequency = 20  # 10 → 20 (더 안정적인 학습)
-        
+        self.entropy_coef = 0.022
+        self.value_coef = 0.65
+        self.max_grad_norm = 0.3
+        self.target_kl = 0.01
+
+        # Learning rate scheduling (KL-based) - critic에만 적용
+        self.initial_learning_rate = self.critic_learning_rate
+        self.current_learning_rate = self.critic_learning_rate
+
+        # On-policy buffers
+        self.episode_buffer = []
+        # 업데이트 주기: 배치 크기와 최소 32로 설정 (너무 커서 미학습 되는 문제 방지)
+        self.update_frequency = 128
+
         # Build actor and critic networks
         self.actor = self.build_actor()
         self.critic = self.build_critic()
-        
-        # Optimizers
-        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=self.current_learning_rate)
+
+        # Optimizers (actor/critic 분리 학습률)
+        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=self.actor_learning_rate)
         self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=self.current_learning_rate)
-        
+
         # Experience buffer
         self.pending_buffer = PendingBuffer()
         self.trajectory_buffer = []
-        
+
+        # Monitoring
+        self.last_kl = 0.0
+        self.last_train_stats = {}
+
+        # Reward normalization (Welford)
+        self.reward_mean = 0.0
+        self.reward_M2 = 0.0
+        self.reward_count = 0
+
+    # ---------------------------
+    # Save / Load
+    # ---------------------------
     def save_model(self, file_path):
-        actor_path = file_path.replace('.h5', '_actor.h5')
-        critic_path = file_path.replace('.h5', '_critic.h5')
+        actor_path = file_path.replace(".h5", "_actor.h5")
+        critic_path = file_path.replace(".h5", "_critic.h5")
         self.actor.save_weights(actor_path)
         self.critic.save_weights(critic_path)
         print(f"Model weights saved at {actor_path} and {critic_path}")
-        
+
     def load_model(self, file_path):
-        actor_path = file_path.replace('.h5', '_actor.h5')
-        critic_path = file_path.replace('.h5', '_critic.h5')
+        actor_path = file_path.replace(".h5", "_actor.h5")
+        critic_path = file_path.replace(".h5", "_critic.h5")
         if os.path.exists(actor_path) and os.path.exists(critic_path):
             self.actor.load_weights(actor_path)
             self.critic.load_weights(critic_path)
             print(f"Model weights loaded from {actor_path} and {critic_path}")
         else:
             print(f"No model weights found at {actor_path} or {critic_path}")
-            
+
+    # ---------------------------
+    # Networks
+    # ---------------------------
     def build_shared_network(self):
         """공통 feature extraction network 구축"""
         vehicle_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")
         request_input = Input(shape=(cfg.MAX_NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")
-        relation_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input")
-        
-        # Embed vehicles and requests
-        v_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(vehicle_input)
-        r_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(request_input)
-        
-        # Create vehicle-request pairs
-        v_expand = tf.expand_dims(v_embed, axis=2)  # (B, V, 1, H)
-        r_expand = tf.expand_dims(r_embed, axis=1)  # (B, 1, R, H)
-        
-        v_tiled = tf.tile(v_expand, [1, 1, cfg.MAX_NUM_REQUEST, 1])  # (B, V, R, H)
-        r_tiled = tf.tile(r_expand, [1, cfg.MAX_NUM_VEHICLES, 1, 1])  # (B, V, R, H)
-        
-        # Concatenate all features
+        relation_input = Input(
+            shape=(cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM),
+            name="relation_input",
+        )
+
+        v_embed = TimeDistributed(Dense(self.hidden_dim, activation="relu"))(vehicle_input)
+        r_embed = TimeDistributed(Dense(self.hidden_dim, activation="relu"))(request_input)
+
+        # KerasTensor 안전 처리를 위해 Lambda 사용
+        v_expand = Lambda(lambda x: tf.expand_dims(x, axis=2))(v_embed)  # (B, V, 1, H)
+        r_expand = Lambda(lambda x: tf.expand_dims(x, axis=1))(r_embed)  # (B, 1, R, H)
+
+        v_tiled = Lambda(lambda x: tf.tile(x, [1, 1, cfg.MAX_NUM_REQUEST, 1]))(v_expand)  # (B, V, R, H)
+        r_tiled = Lambda(lambda x: tf.tile(x, [1, cfg.MAX_NUM_VEHICLES, 1, 1]))(r_expand)  # (B, V, R, H)
+
         pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled, relation_input])  # (B, V, R, 2H + Drel)
-        
         return [vehicle_input, request_input, relation_input], pair_embed, v_embed, r_embed
-        
+
     def build_actor(self):
         """Policy network (Actor) 구축"""
         inputs, pair_embed, v_embed, r_embed = self.build_shared_network()
-        
-        # Process vehicle-request pairs for matching actions
-        match_logits = TimeDistributed(TimeDistributed(Dense(self.hidden_dim, activation='relu')))(pair_embed)
-        match_logits = TimeDistributed(TimeDistributed(Dense(1, kernel_initializer='glorot_uniform', bias_initializer='zeros')))(match_logits)
+
+        match_logits = TimeDistributed(TimeDistributed(Dense(self.hidden_dim, activation="relu")))(pair_embed)
+        match_logits = TimeDistributed(TimeDistributed(Dense(1, kernel_initializer="glorot_uniform", bias_initializer="zeros")))(
+            match_logits
+        )
         match_logits = Lambda(lambda x: tf.squeeze(x, axis=-1))(match_logits)  # (B, V, R)
-        
-        # Process reject actions
-        r_summary = tf.reduce_mean(r_embed, axis=1)  # (B, H)
+
+        r_summary = Lambda(lambda x: tf.reduce_mean(x, axis=1))(r_embed)  # (B, H)
         r_summary = RepeatVector(cfg.MAX_NUM_VEHICLES)(r_summary)  # (B, V, H)
         reject_context = Concatenate(axis=-1)([v_embed, r_summary])  # (B, V, 2H)
-        
-        reject_logits = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(reject_context)
-        reject_logits = TimeDistributed(Dense(1, kernel_initializer='glorot_uniform', bias_initializer='zeros'))(reject_logits)  # (B, V, 1)
-        
-        # Combine all action logits
+
+        reject_logits = TimeDistributed(Dense(self.hidden_dim, activation="relu"))(reject_context)
+        reject_logits = TimeDistributed(Dense(1, kernel_initializer="glorot_uniform", bias_initializer="zeros"))(reject_logits)  # (B, V, 1)
+
         action_logits = Concatenate(axis=-1)([match_logits, reject_logits])  # (B, V, R+1)
-        
         return Model(inputs=inputs, outputs=action_logits)
-        
+
     def build_critic(self):
         """Value network (Critic) 구축"""
         inputs, pair_embed, v_embed, r_embed = self.build_shared_network()
-        
-        # Global state representation for value estimation
-        global_v = tf.reduce_mean(v_embed, axis=1)  # (B, H)
-        global_r = tf.reduce_mean(r_embed, axis=1)  # (B, H)
+
+        global_v = Lambda(lambda x: tf.reduce_mean(x, axis=1))(v_embed)  # (B, H)
+        global_r = Lambda(lambda x: tf.reduce_mean(x, axis=1))(r_embed)  # (B, H)
         global_state = Concatenate(axis=-1)([global_v, global_r])  # (B, 2H)
-        
-        # Value estimation
-        value = Dense(self.hidden_dim, activation='relu')(global_state)
-        value = Dense(self.hidden_dim, activation='relu')(value)
-        value = Dense(1, kernel_initializer='glorot_uniform', bias_initializer='zeros')(value)  # (B, 1)
-        
-        # 출력 값 클리핑으로 극값 방지
-        value = tf.clip_by_value(value, -10.0, 10.0)
-        
+
+        value = Dense(self.hidden_dim, activation="relu")(global_state)
+        value = Dense(self.hidden_dim, activation="relu")(value)
+        value = Dense(1, kernel_initializer="glorot_uniform", bias_initializer="zeros")(value)  # (B, 1)
+
+        # (선택) 크리틱 폭주 방지 - 너무 강하면 학습 신호 죽을 수 있어 범위를 완화
+        value = Lambda(lambda x: tf.clip_by_value(x, -50.0, 50.0))(value)
         return Model(inputs=inputs, outputs=value)
-        
+
+    # ---------------------------
+    # Action / Value
+    # ---------------------------
     def get_action_probs(self, state, action_mask):
-        """상태에서 액션 확률 분포 계산"""
+        """
+        상태에서 액션 확률 분포 계산
+        - invalid action은 logits를 -1e9로 만들어 softmax 후 확률이 사실상 0이 되게 처리
+        - temperature 제거(=1.0) 및 과도한 클리핑 완화
+        """
         logits = self.actor(state, training=False)  # (B, V, A)
-        
-        # Actor 출력 직접 디버깅
-        # print(f"[Debug] Raw logits: min={tf.reduce_min(logits):.6f}, max={tf.reduce_max(logits):.6f}")
-        # print(f"[Debug] Raw logits has_inf={tf.reduce_any(tf.math.is_inf(logits))}, has_nan={tf.reduce_any(tf.math.is_nan(logits))}")
-        
-        # NaN/무한대 직접 처리 (가장 강력한 방법)
+
+        # NaN/Inf -> 0
         logits = tf.where(tf.math.is_finite(logits), logits, tf.zeros_like(logits))
-        logits = tf.clip_by_value(logits, -5.0, 5.0)
-        # print(f"[Debug] Cleaned logits: min={tf.reduce_min(logits):.6f}, max={tf.reduce_max(logits):.6f}")
-        
-        # Apply action mask (더 안전한 값 사용) - dtype 일치
-        masked_logits = tf.where(action_mask == 1, logits, tf.constant(-5.0, dtype=logits.dtype))
-        
-        # Convert to probabilities (대폭 강화된 수치적 안정성)
-        # 더 강한 로그잇 클리핑
-        clipped_logits = tf.clip_by_value(masked_logits, -5.0, 5.0)
-        
-        # 온도 조정 소프트맥스 (더 안정적)
-        temperature = 2.0
-        scaled_logits = clipped_logits / temperature
-        action_probs = tf.nn.softmax(scaled_logits, axis=-1)
-        
-        # 더 높은 확률 하한선
-        action_probs = tf.maximum(action_probs, 1e-6)
-        
-        # 재정규화
+        # 과도한 제한은 학습 신호를 죽일 수 있어 완화된 클리핑만
+        logits = tf.clip_by_value(logits, -20.0, 20.0)
+
+        # Mask: invalid logits -> very negative
+        neg_inf = tf.constant(-1e9, dtype=logits.dtype)
+        masked_logits = tf.where(tf.equal(action_mask, 1), logits, neg_inf)
+
+        # Softmax
+        action_probs = tf.nn.softmax(masked_logits, axis=-1)
+
+        # 수치 안정: 0 방지(로그 계산용) + 재정규화
+        action_probs = tf.clip_by_value(action_probs, 1e-8, 1.0)
         action_probs = action_probs / tf.reduce_sum(action_probs, axis=-1, keepdims=True)
-        
-        # 최종 확률 체크
-        action_probs = tf.where(tf.math.is_finite(action_probs), action_probs, tf.constant(1e-6, dtype=action_probs.dtype))
-        # print(f"[Debug] Final action_probs: min={tf.reduce_min(action_probs):.6f}, max={tf.reduce_max(action_probs):.6f}")
-        
+
         return action_probs, logits
-        
+
     def act(self, state, action_mask):
         action_probs, logits = self.get_action_probs(state, action_mask)
-        
-        # 유효한 액션들의 인덱스 찾기 
+
+        # 유효 액션이 없으면 예외 처리
         valid_actions = tf.where(action_mask == 1)
-        
         if tf.shape(valid_actions)[0] == 0:
-            # 유효한 액션이 없는 경우 (예외 상황)
-            # print("[Warning] 유효한 Action이 없음")
             vehicle_idx = 0
             action_idx = cfg.POSSIBLE_ACTION - 1  # REJECT
             action_prob_value = 1.0
+            logp_value = 0.0
         else:
-            # 마스킹된 확률 분포에서 샘플링
             masked_probs = tf.where(action_mask == 1, action_probs, tf.constant(0.0, dtype=action_probs.dtype))
             masked_probs_flat = tf.reshape(masked_probs, (-1,))
-            
-            # 확률이 0이 아닌 액션들만 고려
+
             non_zero_indices = tf.where(masked_probs_flat > 0)[:, 0]
-            
             if tf.shape(non_zero_indices)[0] == 0:
-                # 모든 확률이 0인 경우 - 유효한 액션 중 균등하게 선택
-                # print("[Warning] 모든 action 확률이 0임")
+                # 유효 액션 중 균등
                 valid_indices_flat = tf.reshape(tf.where(action_mask == 1), (-1,))
-                # 2D 인덱스를 1D로 변환
-                vehicle_indices = valid_indices_flat[::2]  # 짝수 인덱스 (vehicle)
-                action_indices = valid_indices_flat[1::2]  # 홀수 인덱스 (action)
+                vehicle_indices = valid_indices_flat[::2]
+                action_indices = valid_indices_flat[1::2]
                 flat_valid_indices = vehicle_indices * cfg.POSSIBLE_ACTION + action_indices
-                
-                # 균등 확률로 샘플링
+
                 random_idx = tf.random.uniform([], 0, tf.shape(flat_valid_indices)[0], dtype=tf.int32)
                 flat_action_idx = flat_valid_indices[random_idx]
-                
+
                 vehicle_idx = int(flat_action_idx // cfg.POSSIBLE_ACTION)
                 action_idx = int(flat_action_idx % cfg.POSSIBLE_ACTION)
                 action_prob_value = 1.0 / float(tf.shape(flat_valid_indices)[0])
+                logp_value = float(np.log(max(action_prob_value, 1e-8)))
             else:
                 non_zero_probs = tf.gather(masked_probs_flat, non_zero_indices)
-                
-                # 정규화
                 non_zero_probs = non_zero_probs / tf.reduce_sum(non_zero_probs)
-                
-                # 샘플링
+
                 sampled_idx = tf.random.categorical(tf.math.log(non_zero_probs[tf.newaxis, :]), 1)[0, 0]
                 flat_action_idx = non_zero_indices[sampled_idx]
-                
-                # 차량과 액션 인덱스 계산 (GPU 친화적 연산)
+
                 flat_action_idx_int64 = tf.cast(flat_action_idx, dtype=tf.int64)
                 possible_action_int64 = tf.constant(cfg.POSSIBLE_ACTION, dtype=tf.int64)
                 vehicle_idx_int64 = tf.math.floordiv(flat_action_idx_int64, possible_action_int64)
                 action_idx_int64 = flat_action_idx_int64 - vehicle_idx_int64 * possible_action_int64
-                
+
                 vehicle_idx = int(vehicle_idx_int64.numpy())
                 action_idx = int(action_idx_int64.numpy())
-                
-                # 해당 액션의 확률
+
                 action_prob_value = float(action_probs[0][vehicle_idx][action_idx].numpy())
-        
+                logp_value = float(np.log(max(action_prob_value, 1e-8)))
+
         info = {
-            'mode': 'sample',
-            'action_prob': action_prob_value,
-            'logits': logits.numpy()
+            "mode": "sample",
+            "action_prob": action_prob_value,
+            "logp": logp_value,          # PPO 학습에서 ratio 계산 안정성을 위해 저장
+            "logits": logits.numpy(),
         }
-        
         return [vehicle_idx, action_idx, info]
-        
+
     def get_value(self, state):
-        """상태 가치 추정"""
         return self.critic(state, training=False)
-        
+
+    # ---------------------------
+    # Buffering
+    # ---------------------------
     def remember(self, transition):
-        """에피소드 기반으로 경험 저장"""
         self.episode_buffer.append(transition)
-        
+
     def pending(self, transition):
-        """Pending action 처리"""
         action = transition[1]
-        action_id = action[2]['id']
+        action_id = action[2]["id"]
         self.pending_buffer.add(action_id, transition)
-        
+
     def confirm_and_remember(self, action_id, reward):
-        """Pending action 확정 및 경험 저장"""
         transition = self.pending_buffer.confirm(action_id, reward)
         if transition is not None:
             self.remember(transition)
-            
+
     def finish_episode(self):
-        """에피소드가 끝날 때 trajectory buffer에 추가"""
         if len(self.episode_buffer) > 0:
-            # print(f"[Debug] finish_episode: episode_buffer {len(self.episode_buffer)}개 → trajectory_buffer")
             self.trajectory_buffer.extend(self.episode_buffer)
-            # print(f"[Debug] finish_episode 후: trajectory_buffer 크기 = {len(self.trajectory_buffer)}")
             self.episode_buffer = []
-            
+
     def should_train(self):
-        """학습을 수행할 조건 확인"""
-        should = len(self.trajectory_buffer) >= self.update_frequency
-        # if should:
-        #     print(f"[Debug] should_train() = True, buffer 크기: {len(self.trajectory_buffer)}")
-        return should
-        
+        return len(self.trajectory_buffer) >= self.update_frequency
+
+    # ---------------------------
+    # Reward normalization (Welford)
+    # ---------------------------
+    def _update_reward_stats(self, rewards: np.ndarray):
+        for r in rewards:
+            self.reward_count += 1
+            delta = r - self.reward_mean
+            self.reward_mean += delta / self.reward_count
+            delta2 = r - self.reward_mean
+            self.reward_M2 += delta * delta2
+
+    def _reward_std(self):
+        if self.reward_count < 2:
+            return 1.0
+        var = self.reward_M2 / (self.reward_count - 1)
+        return float(np.sqrt(max(var, 1e-8)))
+
+    # ---------------------------
+    # KL-based LR adaptation
+    # ---------------------------
     def update_learning_rate(self, kl_div):
-        """KL divergence 기반 적응적 learning rate 조정 (안전장치 포함)"""
-        # 안전장치: learning rate 범위 제한
         min_lr = 1e-8
         max_lr = 1e-3
-        
-        # 현재 learning rate가 이미 비정상적이면 리셋
+
         if self.current_learning_rate > max_lr or self.current_learning_rate < min_lr:
-            print(f"[Warning] Learning rate {self.current_learning_rate:.2e} is abnormal! Resetting to {self.initial_learning_rate:.2e}")
+            print(f"[Warning] Learning rate {self.current_learning_rate:.2e} abnormal. Reset -> {self.initial_learning_rate:.2e}")
             self.current_learning_rate = self.initial_learning_rate
-        
-        # KL divergence가 너무 작으면 적응 비활성화 (학습이 안정화됨)
+
         if kl_div < 1e-8:
-            # print(f"[Info] KL divergence too small ({kl_div:.8f}), skipping learning rate adaptation")
             return
-            
+
         if kl_div > self.target_kl * 1.5:
-            self.current_learning_rate *= 0.8  # 더 보수적으로 감소
-            print(f"Learning rate decreased to {self.current_learning_rate:.6f}")
+            self.current_learning_rate *= 0.8
         elif kl_div < self.target_kl / 1.5:
-            self.current_learning_rate *= 1.05  # 더 보수적으로 증가
-            print(f"Learning rate increased to {self.current_learning_rate:.6f}")
-        
-        # 범위 재확인 및 클리핑
+            self.current_learning_rate *= 1.05
+
         self.current_learning_rate = max(min_lr, min(max_lr, self.current_learning_rate))
-        
-        # 옵티마이저 learning rate 업데이트
-        self.actor_optimizer.learning_rate.assign(self.current_learning_rate)
+        # Actor lr는 고정(3e-6) 유지
         self.critic_optimizer.learning_rate.assign(self.current_learning_rate)
-        
-    def compute_gae(self, rewards, values, dones):
-        """Generalized Advantage Estimation 계산 (NaN 안전장치 포함)"""
-        # 입력 값 NaN 체크 및 대체
-        if np.any(np.isnan(values)):
-            # print("[Warning] Values contain NaN! Replacing with zeros.")
-            values = np.nan_to_num(values, nan=0.0)
-        
-        if np.any(np.isnan(rewards)):
-            # print("[Warning] Rewards contain NaN! Replacing with zeros.")
-            rewards = np.nan_to_num(rewards, nan=0.0)
-            
-        advantages = []
-        gae = 0
-        
-        for i in reversed(range(len(rewards))):
-            if i == len(rewards) - 1:
-                next_value = 0 if dones[i] else values[i]
-            else:
-                next_value = values[i + 1]
-                
-            delta = rewards[i] + self.gamma * next_value - values[i]
-            gae = delta + self.gamma * self.gae_lambda * gae * (1 - dones[i])
-            
-            # NaN 체크
-            if np.isnan(gae):
-                # print(f"[Warning] GAE is NaN at step {i}! Setting to 0.")
-                gae = 0.0
-                
-            advantages.insert(0, gae)
-            
-        advantages = np.array(advantages, dtype=np.float32)
-        returns = advantages + values
-        
-        # NaN 최종 체크
-        if np.any(np.isnan(advantages)):
-            # print("[Warning] Advantages contain NaN! Replacing with zeros.")
-            advantages = np.nan_to_num(advantages, nan=0.0)
-            
-        if np.any(np.isnan(returns)):
-            # print("[Warning] Returns contain NaN! Replacing with zeros.")
-            returns = np.nan_to_num(returns, nan=0.0)
-        
-        # Normalize advantages
-        if len(advantages) > 1:
-            std_val = np.std(advantages)
-            if std_val > 1e-8:
-                advantages = (advantages - np.mean(advantages)) / std_val
-            else:
-                advantages = advantages - np.mean(advantages)
-        
-        return advantages, returns
-        
-    def train(self):
-        """PPO 학습"""
-        # 학습 조건 강화
-        if len(self.trajectory_buffer) < 5:  # 2 → 5 (더 많은 데이터 요구)
-            # print(f"[Debug] 학습 스킵: trajectory_buffer 크기 = {len(self.trajectory_buffer)}")
-            return None
-        
-        # print(f"[Debug] 학습 시작: trajectory_buffer 크기 = {len(self.trajectory_buffer)}")
-            
-        batch = self.trajectory_buffer[:]  # 모든 데이터 사용
-        
-        # 상태, 액션, 보상 등 추출
-        states = [
-            np.array([b[0][0][0] for b in batch]),  # vehicle states
-            np.array([b[0][1][0] for b in batch]),  # request states  
-            np.array([b[0][2][0] for b in batch])   # relation states
-        ]
-        
-        actions = np.array([[b[1][0], b[1][1]] for b in batch])  # (B, 2)
-        rewards = np.array([b[2] for b in batch], dtype=np.float32)
-        next_states = [
-            np.array([b[3][0][0] for b in batch]),
-            np.array([b[3][1][0] for b in batch]),
-            np.array([b[3][2][0] for b in batch])
-        ]
-        dones = np.array([b[4] for b in batch], dtype=np.float32)
-        action_masks = np.array([b[5]['m'] for b in batch])
-        old_action_probs = np.array([b[1][2]['action_prob'] for b in batch], dtype=np.float32)
-        
-        # 가치 추정
-        values = tf.reshape(self.get_value(states), [-1]).numpy()
-        next_values = tf.reshape(self.get_value(next_states), [-1]).numpy()
-        
-        # print(f"[Debug] values: min={np.min(values):.6f}, max={np.max(values):.6f}, mean={np.mean(values):.6f}")
-        # print(f"[Debug] rewards: min={np.min(rewards):.6f}, max={np.max(rewards):.6f}, mean={np.mean(rewards):.6f}")
-        # print(f"[Debug] old_action_probs: min={np.min(old_action_probs):.6f}, max={np.max(old_action_probs):.6f}")
-        
-        # GAE 계산
-        advantages, returns = self.compute_gae(rewards, values, dones)
-        # print(f"[Debug] advantages: min={np.min(advantages):.6f}, max={np.max(advantages):.6f}, has_nan={np.any(np.isnan(advantages))}")
-        # print(f"[Debug] returns: min={np.min(returns):.6f}, max={np.max(returns):.6f}, has_nan={np.any(np.isnan(returns))}")
-        
-        # PPO 업데이트
-        total_actor_loss = 0
-        total_critic_loss = 0
-        
-        for epoch in range(4):  # PPO는 보통 여러 epoch으로로 학습
-            # Actor 업데이트
-            with tf.GradientTape() as tape:
-                action_probs, _ = self.get_action_probs(states, action_masks)
-                
-                # 선택된 액션의 확률 추출
-                batch_indices = tf.range(tf.shape(actions)[0])
-                action_indices = tf.stack([batch_indices, actions[:, 0], actions[:, 1]], axis=1)
-                new_action_probs = tf.gather_nd(action_probs, action_indices)
-                
-                # Ratio 계산 - 안전한 방식
-                ratio = new_action_probs / tf.maximum(old_action_probs, 1e-8)
-                ratio = tf.clip_by_value(ratio, 0.1, 10.0)  # 극값 클리핑
-                
-                # Clipped surrogate objective
-                surr1 = ratio * advantages
-                surr2 = tf.clip_by_value(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-                
-                # Entropy bonus
-                entropy = -tf.reduce_sum(action_probs * tf.math.log(action_probs + 1e-8), axis=-1)
-                entropy = tf.reduce_mean(entropy)
-                
-                # Actor loss (KL Divergence 제거)
-                actor_loss = -tf.reduce_mean(tf.minimum(surr1, surr2)) - self.entropy_coef * entropy
-                
-                # Actor loss NaN 체크
-                if tf.math.is_nan(actor_loss):
-                    # print(f"[Warning] Actor loss is NaN! Setting to 0.")
-                    actor_loss = tf.constant(0.0)
-                # print(f"[Debug] Epoch {epoch}: Actor loss = {actor_loss:.6f}")
-                
-            # Actor gradients
-            actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
-            if actor_grads is not None:
-                actor_grads = [tf.clip_by_norm(grad, self.max_grad_norm) for grad in actor_grads if grad is not None]
-                self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
-            
-            # Critic 업데이트
-            with tf.GradientTape() as tape:
-                current_values = tf.reshape(self.get_value(states), [-1])
-                critic_loss = tf.reduce_mean(tf.square(returns - current_values))
-                
-                # Critic loss NaN 체크
-                if tf.math.is_nan(critic_loss):
-                    # print(f"[Warning] Critic loss is NaN! Setting to 0.")
-                    critic_loss = tf.constant(0.0)
-                # print(f"[Debug] Epoch {epoch}: Critic loss = {critic_loss:.6f}")
-                
-            critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
-            if critic_grads is not None:
-                critic_grads = [tf.clip_by_norm(grad, self.max_grad_norm) for grad in critic_grads if grad is not None]
-                self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
-            
-            # Loss 축적 (NaN 안전하게)
-            actor_loss_val = actor_loss.numpy()
-            critic_loss_val = critic_loss.numpy()
-            
-            if not np.isnan(actor_loss_val):
-                total_actor_loss += actor_loss_val
-            # else:
-            #     print(f"[Warning] Skipping NaN actor loss at epoch {epoch}")
-                
-            if not np.isnan(critic_loss_val):
-                total_critic_loss += critic_loss_val
-            # else:
-            #     print(f"[Warning] Skipping NaN critic loss at epoch {epoch}")
-            
-            # KL Divergence Early Stopping 제거 (클리핑만으로 제어)
-        
-        # 버퍼 정리
-        self.trajectory_buffer = []
-        
-        return (total_actor_loss / 4, total_critic_loss / 4)
-        
+
     def reset_learning_rate(self):
-        """Learning rate를 초기값으로 리셋"""
         self.current_learning_rate = self.initial_learning_rate
-        self.actor_optimizer.learning_rate.assign(self.current_learning_rate)
+        # Actor lr 고정 유지
         self.critic_optimizer.learning_rate.assign(self.current_learning_rate)
         print(f"Learning rate reset to {self.current_learning_rate:.6f}")
-        
+
+    # ---------------------------
+    # GAE (FIXED: use next_values bootstrap properly)
+    # ---------------------------
+    def compute_gae(self, rewards, values, next_values, dones):
+        """
+        Standard GAE:
+          delta_t = r_t + gamma * V(s_{t+1}) * (1-done) - V(s_t)
+          A_t = delta_t + gamma*lambda*(1-done)*A_{t+1}
+        """
+        rewards = np.nan_to_num(np.asarray(rewards, dtype=np.float32), nan=0.0)
+        values = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0)
+        next_values = np.nan_to_num(np.asarray(next_values, dtype=np.float32), nan=0.0)
+        dones = np.asarray(dones, dtype=np.float32)
+
+        advantages = np.zeros_like(rewards, dtype=np.float32)
+        gae = 0.0
+
+        for t in reversed(range(len(rewards))):
+            not_done = 1.0 - dones[t]
+            delta = rewards[t] + self.gamma * next_values[t] * not_done - values[t]
+            gae = delta + self.gamma * self.gae_lambda * not_done * gae
+            advantages[t] = gae
+
+        returns = advantages + values
+
+        # Advantage normalization (standard)
+        if len(advantages) > 1:
+            adv_mean = float(np.mean(advantages))
+            adv_std = float(np.std(advantages))
+            if adv_std > 1e-8:
+                advantages = (advantages - adv_mean) / adv_std
+            else:
+                advantages = advantages - adv_mean
+
+        return advantages.astype(np.float32), returns.astype(np.float32)
+
+    # ---------------------------
+    # Training (FIXED: minibatch PPO, no extra ratio pre-clip, target_kl early stop, LR adapt)
+    # ---------------------------
+    def train(self):
+        if len(self.trajectory_buffer) < self.update_frequency:
+            # 학습 스킵 시에도 상태 기록 (버퍼 크기 확인용)
+            self.last_train_stats = {
+                "buffer_size": len(self.trajectory_buffer),
+                "trajectory_buffer_size": len(self.trajectory_buffer),
+                "train_updates": 0,
+                "avg_kl": 0.0,
+                "actor_loss": 0.0,
+                "critic_loss": 0.0,
+                "entropy": 0.0,
+                "clip_fraction": 0.0,
+                "explained_variance": 0.0,
+                "skipped_actor": 0,
+                "skipped_critic": 0,
+            }
+            return None
+
+        batch = self.trajectory_buffer[:]
+        self.trajectory_buffer = []
+        buffer_size_used = len(batch)
+
+        # Extract arrays
+        states = [
+            np.array([b[0][0][0] for b in batch], dtype=np.float32),  # vehicle states
+            np.array([b[0][1][0] for b in batch], dtype=np.float32),  # request states
+            np.array([b[0][2][0] for b in batch], dtype=np.float32),  # relation states
+        ]
+        next_states = [
+            np.array([b[3][0][0] for b in batch], dtype=np.float32),
+            np.array([b[3][1][0] for b in batch], dtype=np.float32),
+            np.array([b[3][2][0] for b in batch], dtype=np.float32),
+        ]
+
+        actions = np.array([[b[1][0], b[1][1]] for b in batch], dtype=np.int32)  # (N,2)
+        rewards = np.array([b[2] for b in batch], dtype=np.float32)
+        dones = np.array([b[4] for b in batch], dtype=np.float32)
+        action_masks = np.array([b[5]["m"] for b in batch], dtype=np.int32)
+
+        # Prefer stored old logp if present, else fallback to log(prob)
+        old_logps = []
+        for b in batch:
+            info = b[1][2]
+            if "logp" in info and np.isfinite(info["logp"]):
+                old_logps.append(info["logp"])
+            else:
+                p = float(info.get("action_prob", 1e-8))
+                old_logps.append(np.log(max(p, 1e-8)))
+        old_logps = np.array(old_logps, dtype=np.float32)
+
+        # Reward normalization (apply for real)
+        self._update_reward_stats(rewards)
+        r_std = self._reward_std()
+        rewards_norm = (rewards - float(self.reward_mean)) / (r_std + 1e-8)
+
+        # Values
+        values = tf.reshape(self.get_value(states), [-1]).numpy().astype(np.float32)
+        next_values = tf.reshape(self.get_value(next_states), [-1]).numpy().astype(np.float32)
+
+        # GAE
+        advantages, returns = self.compute_gae(rewards_norm, values, next_values, dones)
+
+        # PPO updates
+        K = 6  # epochs
+        N = len(rewards)
+        B = min(self.batch_size, N)
+
+        total_actor_loss = 0.0
+        total_critic_loss = 0.0
+        total_kl = 0.0
+        total_entropy = 0.0
+        total_clip_frac = 0.0
+        total_batches = 0
+        n_updates = 0
+        skipped_actor = 0
+        skipped_critic = 0
+
+        early_stop = False
+
+        # Explained variance (사전 계산: 업데이트 전 value 예측 기준)
+        var_ret = np.var(returns)
+        explained_variance = 0.0
+        if var_ret > 1e-8:
+            explained_variance = 1.0 - np.var(returns - values) / (var_ret + 1e-8)
+
+        for epoch in range(K):
+            idx = np.random.permutation(N)
+
+            for start in range(0, N, B):
+                mb_idx = idx[start : start + B]
+                if len(mb_idx) == 0:
+                    continue
+
+                mb_states = [s[mb_idx] for s in states]
+                mb_actions = actions[mb_idx]
+                mb_masks = action_masks[mb_idx]
+                mb_adv = advantages[mb_idx]
+                mb_ret = returns[mb_idx]
+                mb_old_logp = old_logps[mb_idx]
+
+                mb_adv_tf = tf.convert_to_tensor(mb_adv, dtype=tf.float32)
+                mb_ret_tf = tf.convert_to_tensor(mb_ret, dtype=tf.float32)
+                mb_old_logp_tf = tf.convert_to_tensor(mb_old_logp, dtype=tf.float32)
+
+                # ---------------- Actor update ----------------
+                with tf.GradientTape() as tape:
+                    action_probs, _ = self.get_action_probs(mb_states, mb_masks)
+                    action_probs_fp32 = tf.cast(action_probs, tf.float32)
+
+                    batch_indices = tf.range(tf.shape(mb_actions)[0], dtype=tf.int32)
+                    action_indices = tf.stack([batch_indices, mb_actions[:, 0], mb_actions[:, 1]], axis=1)
+                    new_probs = tf.gather_nd(action_probs_fp32, action_indices)
+                    new_probs = tf.clip_by_value(new_probs, 1e-8, 1.0)
+
+                    logp_new = tf.math.log(new_probs)
+                    logp_old = tf.cast(mb_old_logp_tf, dtype=logp_new.dtype)
+
+                    ratio = tf.exp(logp_new - logp_old)  # NO extra pre-clip
+
+                    surr1 = ratio * mb_adv_tf
+                    surr2 = tf.clip_by_value(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * mb_adv_tf
+                    policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+
+                    # Entropy (invalid probs are ~0 due to -1e9 masking)
+                    entropy = -tf.reduce_sum(action_probs_fp32 * tf.math.log(action_probs_fp32 + 1e-8), axis=-1)
+                    entropy = tf.reduce_mean(entropy)
+
+                    actor_loss = policy_loss - self.entropy_coef * entropy
+
+                    # Approx KL for monitoring / early stop
+                    approx_kl = tf.reduce_mean(logp_old - logp_new)
+                    # Clip fraction: 비율이 클리핑 범위를 벗어난 비율
+                    clip_fraction = tf.reduce_mean(tf.cast(tf.abs(ratio - 1.0) > self.clip_ratio, tf.float32))
+
+                # NaN/Inf 방지: 비정상 손실이면 스킵
+                if not tf.reduce_all(tf.math.is_finite(actor_loss)):
+                    # print("[Warn] skip actor update due to non-finite loss")
+                    skipped_actor += 1
+                    continue
+
+                actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
+                actor_grads = [g for g in actor_grads if g is not None]
+                actor_grads = [tf.clip_by_norm(g, self.max_grad_norm) for g in actor_grads]
+                self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
+
+                # ---------------- Critic update ----------------
+                with tf.GradientTape() as tape:
+                    v_pred = tf.cast(tf.reshape(self.get_value(mb_states), [-1]), tf.float32)
+                    diff = mb_ret_tf - v_pred
+                    huber_delta = 1.0
+                    huber = tf.where(
+                        tf.abs(diff) < huber_delta,
+                        0.5 * tf.square(diff),
+                        huber_delta * (tf.abs(diff) - 0.5 * huber_delta),
+                    )
+                    critic_loss = tf.reduce_mean(huber) * self.value_coef
+                if not tf.reduce_all(tf.math.is_finite(critic_loss)):
+                    # print("[Warn] skip critic update due to non-finite loss")
+                    skipped_critic += 1
+                    continue
+
+                critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
+                critic_grads = [g for g in critic_grads if g is not None]
+                critic_grads = [tf.clip_by_norm(g, self.max_grad_norm) for g in critic_grads]
+                self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
+
+                # Accumulate
+                total_actor_loss += float(actor_loss.numpy())
+                total_critic_loss += float(critic_loss.numpy())
+                kl_val = float(approx_kl.numpy())
+                total_kl += kl_val
+                total_entropy += float(entropy.numpy())
+                total_clip_frac += float(clip_fraction.numpy())
+                total_batches += 1
+                n_updates += 1
+
+                # Early stopping on KL (standard PPO safety)
+                if kl_val > self.target_kl * 1.5:
+                    early_stop = True
+                    break
+
+            if early_stop:
+                break
+
+        # Stats
+        if n_updates == 0:
+            self.last_kl = 0.0
+            self.last_train_stats = {
+                "buffer_size": buffer_size_used,
+                "trajectory_buffer_size": buffer_size_used,
+                "train_updates": 0,
+                "avg_kl": 0.0,
+                "actor_loss": 0.0,
+                "critic_loss": 0.0,
+                "entropy": 0.0,
+                "clip_fraction": 0.0,
+                "explained_variance": float(explained_variance),
+                "skipped_actor": skipped_actor,
+                "skipped_critic": skipped_critic,
+            }
+            return None
+
+        avg_actor_loss = total_actor_loss / n_updates
+        avg_critic_loss = total_critic_loss / n_updates
+        avg_kl = total_kl / n_updates
+        avg_entropy = total_entropy / max(total_batches, 1)
+        avg_clip_frac = total_clip_frac / max(total_batches, 1)
+        self.last_kl = avg_kl
+
+        # Apply KL-based LR adaptation (now actually used)
+        self.update_learning_rate(avg_kl)
+
+        # Save last train stats for logging
+        self.last_train_stats = {
+            "buffer_size": buffer_size_used,
+            "trajectory_buffer_size": buffer_size_used,
+            "train_updates": n_updates,
+            "avg_kl": float(avg_kl),
+            "actor_loss": float(avg_actor_loss),
+            "critic_loss": float(avg_critic_loss),
+            "entropy": float(avg_entropy),
+            "clip_fraction": float(avg_clip_frac),
+            "explained_variance": float(explained_variance),
+            "skipped_actor": skipped_actor,
+            "skipped_critic": skipped_critic,
+        }
+
+        return (avg_actor_loss, avg_critic_loss)

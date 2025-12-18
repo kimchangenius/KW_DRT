@@ -1,0 +1,9 @@
+Episode 3 - Initial Vehicle Positions
+==================================================
+Vehicle 0: Node 18
+Vehicle 1: Node 2
+Vehicle 2: Node 22
+Vehicle 3: Node 11
+Vehicle 4: Node 11
+
+Positions: [18, 2, 22, 11, 11]

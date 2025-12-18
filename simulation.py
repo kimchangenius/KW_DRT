@@ -96,6 +96,19 @@ def log_episode(path, info):
         for i, route in enumerate(seq_list):
             route_str = " -> ".join(route)
             f.write(f"DRT{i + 1}: {route_str}\n")
+    
+    # 차량 초기 위치 로깅
+    if 'initial_vehicle_positions' in info:
+        initial_positions = info['initial_vehicle_positions']
+        filename = f'episode_{ep:03}_initial_positions.txt'
+        filepath = os.path.join(path, filename)
+        with open(filepath, "w") as f:
+            f.write(f"Episode {ep} - Initial Vehicle Positions\n")
+            f.write("=" * 50 + "\n")
+            for i, pos in enumerate(initial_positions):
+                f.write(f"Vehicle {i}: Node {pos}\n")
+            f.write("\n")
+            f.write(f"Positions: {initial_positions}\n")
 
 
 def log_all_episodes(path, info_list, total_time):
@@ -152,21 +165,21 @@ def simulation_ddqn(env_builder, config, model_path=None, episodes=20, write_res
         episodes: 시뮬레이션 에피소드 수
         write_result: 결과 저장 여부
     """
-    config_str = ", ".join(f"{k}={v}" for k, v in config.items())
-    print(f"\n<<<< DDQN Simulation Session: {config_str} >>>>")
-
-    # 결과 디렉토리 생성
-    if write_result is True:
-        dqn_folder_config = config.copy()
-        dqn_folder_config["learning_rate"] = config["dqn_learning_rate"]
-        run_name = get_run_folder_name(dqn_folder_config)
-        run_path = os.path.join(RESULT_PATH, "simul_dqn_" + run_name)
-        os.makedirs(run_path, exist_ok=True)
 
     hd = config["hidden_dim"]
     bs = 16
     #bs = config["batch_size"]
     lr = config["dqn_learning_rate"]
+    dqn_config = config.copy()
+    dqn_config["learning_rate"] = config["dqn_learning_rate"]
+    dqn_config["batch_size"] = bs
+
+    # 결과 디렉토리 생성
+    if write_result is True:
+
+        run_name = get_run_folder_name(dqn_config)
+    run_path = os.path.join(RESULT_PATH, "simul_dqn_" + run_name)
+    os.makedirs(run_path, exist_ok=True)
 
     env = env_builder.build()
     agent = DDQNAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
@@ -177,9 +190,6 @@ def simulation_ddqn(env_builder, config, model_path=None, episodes=20, write_res
     # 모델 로드
     if model_path is None:
         # 자동으로 모델 파일 찾기
-        dqn_config = config.copy()
-        dqn_config["learning_rate"] = config["dqn_learning_rate"]
-        dqn_config["batch_size"] = 16  # 실제 모델 파일의 batch_size 사용
         model_name = "{}.h5".format(get_run_folder_name(dqn_config))
         model_path = os.path.join(RESULT_PATH, model_name)
     
@@ -196,15 +206,21 @@ def simulation_ddqn(env_builder, config, model_path=None, episodes=20, write_res
     for ep in range(1, episodes + 1):
         print(f"\n[Episode {ep}/{episodes}] DDQN 시뮬레이션 실행 중...")
         
-        # 각 에피소드마다 다른 시드 사용 (다양성 확보)
-        # episode_seed = ep * 100  # 에피소드별 고유 시드
-        # random.seed(episode_seed)
-        # np.random.seed(episode_seed)
+        # 각 에피소드마다 동일한 시드 사용 (다른 모델과 동일한 환경 조건 보장)
+        episode_seed = ep * 100  # 에피소드별 고유 시드
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+        tf.random.set_seed(episode_seed)
         
         # agent.epsilon = 0.05
         agent.epsilon = 0.0
 
-        state = env.reset()
+        # 랜덤 차량 위치로 환경 리셋 (에피소드마다 다른 위치)
+        state = env.reset(random_vehicle_positions=True)
+        
+        # 차량 초기 위치 저장 (로깅용)
+        initial_vehicle_positions = env.vehicle_init_pos.copy() if hasattr(env, 'vehicle_init_pos') else []
+        
         total_reward = 0.0
         step_count = 0
         action_count = 0
@@ -314,6 +330,7 @@ def simulation_ddqn(env_builder, config, model_path=None, episodes=20, write_res
         print(f"[Episode {ep}] 완료 - 보상: {total_reward:.2f}, 스텝: {step_count}, 행동: {action_count}")
         print(f"  서비스율: {served_count}/{len(env.done_request_list)} ({served_count/len(env.done_request_list)*100:.1f}%)")
         print(f"  평균 대기시간: {mean_waiting_time:.2f}, 평균 승차시간: {mean_in_vehicle_time:.2f}")
+        print(f"  차량 초기 위치: {initial_vehicle_positions}")
 
         e_info = {
             'episode': ep,
@@ -407,7 +424,18 @@ def simulation_ppo(env_builder, config, model_path=None, episodes=20, write_resu
     for ep in range(1, episodes + 1):
         print(f"\n[Episode {ep}/{episodes}] PPO 시뮬레이션 실행 중...")
         
-        state = env.reset()
+        # 각 에피소드마다 동일한 시드 사용 (DDQN과 동일한 환경 조건 보장)
+        episode_seed = ep * 100  # 에피소드별 고유 시드 (DDQN과 동일)
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+        tf.random.set_seed(episode_seed)
+        
+        # 랜덤 차량 위치로 환경 리셋 (에피소드마다 다른 위치, DDQN과 동일한 시드 사용)
+        state = env.reset(random_vehicle_positions=True)
+        
+        # 차량 초기 위치 저장 (로깅용)
+        initial_vehicle_positions = env.vehicle_init_pos.copy() if hasattr(env, 'vehicle_init_pos') else []
+        
         total_reward = 0.0
         step_count = 0
         action_count = 0
@@ -517,6 +545,7 @@ def simulation_ppo(env_builder, config, model_path=None, episodes=20, write_resu
         print(f"[Episode {ep}] 완료 - 보상: {total_reward:.2f}, 스텝: {step_count}, 행동: {action_count}")
         print(f"  서비스율: {served_count}/{len(env.done_request_list)} ({served_count/len(env.done_request_list)*100:.1f}%)")
         print(f"  평균 대기시간: {mean_waiting_time:.2f}, 평균 승차시간: {mean_in_vehicle_time:.2f}")
+        print(f"  차량 초기 위치: {initial_vehicle_positions}")
 
         e_info = {
             'episode': ep,
@@ -529,7 +558,8 @@ def simulation_ppo(env_builder, config, model_path=None, episodes=20, write_resu
             'mean_detour_time': mean_detour_time,
             'event_sequence': env.event_sequences if hasattr(env, 'event_sequences') else [],
             'drt_info': drt_info_list,
-            'request_info': req_info_list
+            'request_info': req_info_list,
+            'initial_vehicle_positions': initial_vehicle_positions
         }
         
         if write_result is True:
@@ -797,7 +827,6 @@ def simulation_mappo(env_builder, config, model_path=None, episodes=20, write_re
 
 
 def main():
-    """메인 실행 함수"""
     env_builder = EnvBuilder(data_dir=DATA_PATH, result_dir=RESULT_PATH)
 
     print("="*60)
@@ -807,45 +836,39 @@ def main():
     # 사용 가능한 설정들
     available_configs = cfg.config_list
     
-    # print(f"사용 가능한 설정 수: {len(available_configs)}")
-    # for i, config in enumerate(available_configs):
-    #     print(f"  {i+1}. {config}")
-    
     # 첫 번째 설정으로 DDQN 시뮬레이션 실행
     if available_configs:
-        config = available_configs[0]
-        print(f"\n시뮬레이션 실행: {config}")
-        
+        config = available_configs[0]        
         # DDQN 시뮬레이션
-        ddqn_results = simulation_ddqn(env_builder, config, episodes=5, write_result=True)
+        ddqn_results = simulation_ddqn(env_builder, config, episodes=30, write_result=True)
         
         # PPO 시뮬레이션
-        ppo_results = simulation_ppo(env_builder, config, episodes=5, write_result=True)
+        ppo_results = simulation_ppo(env_builder, config, episodes=30, write_result=True)
         
         # MAPPO 시뮬레이션
-        mappo_results = simulation_mappo(env_builder, config, episodes=5, write_result=True)
+        # mappo_results = simulation_mappo(env_builder, config, episodes=10, write_result=True)
         
         print(f"\n{'='*60}")
         print("시뮬레이션 완료!")
         print(f"{'='*60}")
         
         # 결과 비교
-        if ddqn_results and ppo_results and mappo_results:
+        if ddqn_results and ppo_results: # and mappo_results:
             print("\n모델별 성능 비교:")
             print(f"{'모델':<10} {'평균 보상':<12} {'평균 서비스율':<15}")
             print("-" * 40)
             
             ddqn_avg_reward = sum(e['total_reward'] for e in ddqn_results) / len(ddqn_results)
             ppo_avg_reward = sum(e['total_reward'] for e in ppo_results) / len(ppo_results)
-            mappo_avg_reward = sum(e['total_reward'] for e in mappo_results) / len(mappo_results)
+            # mappo_avg_reward = sum(e['total_reward'] for e in mappo_results) / len(mappo_results)
             
             ddqn_service_rate = sum(e['total_num_serve'] for e in ddqn_results) / sum(e['total_num_accept'] for e in ddqn_results) if sum(e['total_num_accept'] for e in ddqn_results) > 0 else 0
             ppo_service_rate = sum(e['total_num_serve'] for e in ppo_results) / sum(e['total_num_accept'] for e in ppo_results) if sum(e['total_num_accept'] for e in ppo_results) > 0 else 0
-            mappo_service_rate = sum(e['total_num_serve'] for e in mappo_results) / sum(e['total_num_accept'] for e in mappo_results) if sum(e['total_num_accept'] for e in mappo_results) > 0 else 0
+            # mappo_service_rate = sum(e['total_num_serve'] for e in mappo_results) / sum(e['total_num_accept'] for e in mappo_results) if sum(e['total_num_accept'] for e in mappo_results) > 0 else 0
             
             print(f"{'DDQN':<10} {ddqn_avg_reward:<12.2f} {ddqn_service_rate:<15.3f}")
             print(f"{'PPO':<10} {ppo_avg_reward:<12.2f} {ppo_service_rate:<15.3f}")
-            print(f"{'MAPPO':<10} {mappo_avg_reward:<12.2f} {mappo_service_rate:<15.3f}")
+            # print(f"{'MAPPO':<10} {mappo_avg_reward:<12.2f} {mappo_service_rate:<15.3f}")
     
 
 if __name__ == "__main__":

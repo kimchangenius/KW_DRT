@@ -12,3 +12,5 @@ train_result/*
 trash/*
 !trash/.gitkeep
 tuning.txt
+train_result/*
+sim_result/*
