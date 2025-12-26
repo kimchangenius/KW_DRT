@@ -1,9 +1,0 @@
-Episode 6 - Initial Vehicle Positions
-==================================================
-Vehicle 0: Node 5
-Vehicle 1: Node 12
-Vehicle 2: Node 12
-Vehicle 3: Node 20
-Vehicle 4: Node 16
-
-Positions: [5, 12, 12, 20, 16]

@@ -23,10 +23,12 @@ param_grid = {
     # "hidden_dim": [64, 128, 256],
     "hidden_dim": [256],
     # "batch_size": [32, 64, 128]
-    "batch_size": [32],
+    "batch_size": [128],
+    "ppo_batch_size": [128],
     # "learning_rate": [1e-4, 1e-5, 1e-6]
     "learning_rate": [1e-5],  # 기본값 
-    "ppo_learning_rate": [3e-4],
+    "critic_learning_rate": [3e-4],
+    "actor_learning_rate": [5e-4],
     "dqn_learning_rate": [1e-4],  # 더 공격적인 learning rate
     "mappo_learning_rate": [3e-4]  # MAPPO learning rate 추가
 }

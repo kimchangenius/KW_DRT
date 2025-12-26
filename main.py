@@ -112,7 +112,7 @@ def log_all_episodes(path, info_list, total_time):
     with open(filepath, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Episode', 'Total Reward', 'Total Loss', 'Total Num. Accept', 'Total Num. Serve',
-                         'Mean Waiting Time', 'Mean In-Vehicle Time', 'Mean Detour Time', 'KL'])
+                         'Mean Waiting Time', 'Mean In-Vehicle Time', 'Mean Detour Time'])
         for e in info_list:
             curr_row = [
                 e['episode'],
@@ -122,8 +122,7 @@ def log_all_episodes(path, info_list, total_time):
                 e['total_num_serve'],
                 f"{e['mean_waiting_time']:.2f}",
                 f"{e['mean_in_vehicle_time']:.2f}",
-                f"{e['mean_detour_time']:.2f}",
-                f"{e.get('kl', 0.0):.6f}"
+                f"{e['mean_detour_time']:.2f}"
             ]
             writer.writerow(curr_row)
     filename = 'episodes_time.txt'
@@ -148,11 +147,19 @@ def get_run_folder_name(config):
     hd = config.get("hidden_dim", "x")
     bs = config.get("batch_size", "x")
     lr = config.get("learning_rate", "x")
-    return f"hd{hd}_bs{bs}_lr{lr}"
+    # 학습률은 소수점 4자리까지 표시하되, 변환이 실패하면 원본을 사용
+    if isinstance(lr, (int, float)):
+        lr_str = f"{lr:.4f}"
+    else:
+        try:
+            lr_str = f"{float(lr):.4f}"
+        except Exception:
+            lr_str = lr
+    return f"hd{hd}_bs{bs}_lr{lr_str}"
 
 
 def train_ddqn(env_builder, config, write_result=False, load_model=False):
-    episodes = 100
+    episodes = 500
     update_freq = 10
     final_train_steps = 5
 
@@ -160,8 +167,7 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
     print(f"\n<<<< Training Session: {config_str} >>>>")
 
     hd = config["hidden_dim"]
-    #bs = config["batch_size"]
-    bs = 16
+    bs = config["batch_size"]
     lr = config["dqn_learning_rate"]
     dqn_config = config.copy()
     dqn_config["learning_rate"] = config["dqn_learning_rate"]
@@ -193,7 +199,8 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
         total_loss = 0.0
         total_reward = 0.0
         state = env.reset()
-        
+        state = sanitize_state(state)
+
         # DDQN 학습률 업데이트
         agent.update_learning_rate(ep)
 
@@ -216,6 +223,7 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                 env.enrich_action(action)
 
                 next_state, reward, info = env.step(action)
+                next_state = sanitize_state(next_state)
                 next_action_mask = env.get_action_mask()
                 
 
@@ -469,9 +477,27 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
     if write_result is True:
         log_all_episodes(run_path, e_info_list, total_time)
 
+def sanitize_state(state):
+    """
+    환경에서 받은 state에 불필요한 배치 차원이 있다면 제거
+    """
+    if isinstance(state, list):
+        clean_list = []
+        for s in state:
+            s_array = np.array(s, dtype=np.float32)
+            if s_array.ndim > 1 and s_array.shape[0] == 1:
+                s_array = np.squeeze(s_array, axis=0)
+            clean_list.append(s_array)
+        return clean_list
+    else:
+        s_array = np.array(state, dtype=np.float32)
+        if s_array.ndim > 1 and s_array.shape[0] == 1:
+            s_array = np.squeeze(s_array, axis=0)
+        return s_array
+
+
 def train_ppo(env_builder, config, write_result=False, load_model=False):
-    episodes = 100
-    final_train_steps = 5
+    episodes = 500
 
     config_str = ", ".join(f"{k}={v}" for k, v in config.items())
     print(f"\n<<<< PPO Training Session: {config_str} >>>>")
@@ -479,7 +505,8 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
     # Create Result Directory
     if write_result is True:
         ppo_folder_config = config.copy()
-        ppo_folder_config["learning_rate"] = config["ppo_learning_rate"]
+        ppo_folder_config["learning_rate"] = config["critic_learning_rate"] + config["actor_learning_rate"]
+        ppo_folder_config["batch_size"] = config["ppo_batch_size"]
         run_name = get_run_folder_name(ppo_folder_config)
         run_path = os.path.join(RESULT_PATH, "ppo_" + run_name)
         os.makedirs(run_path, exist_ok=True)
@@ -493,16 +520,17 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                 print(f"[Warn] 기존 PPO 로그 파일을 삭제하지 못했습니다: {ppo_log_path}")
 
     hd = config["hidden_dim"]
-    bs = config["batch_size"]
-    lr = config["ppo_learning_rate"]
+    bs = config["ppo_batch_size"]
+    actor_lr = config["actor_learning_rate"]
+    critic_lr = config["critic_learning_rate"]
 
     env = env_builder.build()
-    agent = PPOAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
+    agent = PPOAgent(hidden_dim=hd, batch_size=bs, actor_learning_rate=actor_lr, critic_learning_rate=critic_lr)
     
     # 기존 모델 로드 시도
     if load_model is True:
         ppo_config = config.copy()
-        ppo_config["learning_rate"] = config["ppo_learning_rate"]
+        ppo_config["learning_rate"] = config["critic_learning_rate"] + config["actor_learning_rate"]
         model_name = "{}.h5".format(get_run_folder_name(ppo_config))
         model_path = os.path.join(RESULT_PATH, model_name)
         agent.load_model(model_path)
@@ -517,6 +545,7 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
         total_loss = 0.0
         total_reward = 0.0
         state = env.reset()
+        state = sanitize_state(state)
 
         delayed_reward_confirm = 0
 
@@ -539,6 +568,7 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                 env.enrich_action(action)
 
                 next_state, reward, info = env.step(action)
+                next_state = sanitize_state(next_state)
                 next_action_mask = env.get_action_mask()
                 
 
@@ -570,9 +600,10 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                 # PPO는 더 적은 빈도로, 더 많은 데이터로 학습
                 if agent.should_train():
                     curr_loss = agent.train()
+                    print(f"[Debug] Train_update: {agent.last_train_stats['train_updates']}, buffer_size: {agent.last_train_stats['buffer_size']}")
                     if curr_loss is not None:
+                        print(f"[Debug] Step {env.curr_step}: 학습 수행")
                         train_calls_in_ep += 1
-                    if curr_loss is not None:
                         if isinstance(curr_loss, tuple) and len(curr_loss) >= 2:
                             total_loss += curr_loss[0] + curr_loss[1]  # actor_loss + critic_loss
                         else:
@@ -637,18 +668,6 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                 
                 # 에피소드 완료 후 trajectory buffer에 추가
                 agent.finish_episode()
-
-                # 에피소드 끝에서 학습 수행
-                for _ in range(final_train_steps):
-                    if agent.should_train():
-                        curr_loss = agent.train()
-                        if curr_loss is not None:
-                            train_calls_in_ep += 1
-                        if curr_loss is not None:
-                            if isinstance(curr_loss, tuple) and len(curr_loss) >= 2:
-                                total_loss += curr_loss[0] + curr_loss[1]
-                            else:
-                                total_loss += curr_loss
 
                 if len(agent.pending_buffer) != 0:
                     print("[Warning] Pending Buffer is not empty!")
@@ -748,7 +767,6 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                     'mean_waiting_time': mean_waiting_time,
                     'mean_in_vehicle_time': mean_in_vehicle_time,
                     'mean_detour_time': mean_detour_time,
-                    'kl': getattr(agent, 'last_kl', 0.0),
                     'event_sequence': env.event_sequences if hasattr(env, 'event_sequences') else [],
                     'drt_info': drt_info_list,
                     'request_info': req_info_list
@@ -767,7 +785,8 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                     if write_result is True:
                         # PPO 전용 config 사용
                         ppo_save_config = config.copy()
-                        ppo_save_config["learning_rate"] = config["ppo_learning_rate"]
+                        ppo_save_config["learning_rate"] = config["critic_learning_rate"] + config["actor_learning_rate"]
+                        ppo_save_config["batch_size"] = config["ppo_batch_size"]
                         model_name = "{}.h5".format(get_run_folder_name(ppo_save_config))
                         model_path = os.path.join(RESULT_PATH, model_name)
                         agent.save_model(model_path)
@@ -1149,8 +1168,8 @@ def main():
 
 
     for params in cfg.config_list:
-        # train_ddqn(env_builder, params, write_result=True, load_model=False)
-        train_ppo(env_builder, params, write_result=True, load_model=False)
+        train_ddqn(env_builder, params, write_result=True, load_model=False)
+        # train_ppo(env_builder, params, write_result=True, load_model=False)
         # train_mappo(env_builder, params, write_result=True, load_model=False)
 
 

@@ -9,14 +9,13 @@ from tensorflow.keras.layers import Input, Dense, TimeDistributed, Lambda, Conca
 
 
 class PPOAgent:
-    def __init__(self, hidden_dim, batch_size, learning_rate):
+    def __init__(self, hidden_dim, batch_size, actor_learning_rate, critic_learning_rate):
         self.hidden_dim = hidden_dim
         self.batch_size = batch_size
-        self.learning_rate = learning_rate  # critic lr 입력값
 
         # Learning rates 분리
-        self.actor_learning_rate = 5e-4
-        self.critic_learning_rate = learning_rate
+        self.actor_learning_rate = actor_learning_rate
+        self.critic_learning_rate = critic_learning_rate
 
         # PPO hyperparameters
         self.clip_ratio = 0.13
@@ -33,8 +32,8 @@ class PPOAgent:
 
         # On-policy buffers
         self.episode_buffer = []
-        # 업데이트 주기: 배치 크기와 최소 32로 설정 (너무 커서 미학습 되는 문제 방지)
-        self.update_frequency = 128
+        # 업데이트 주기: 배치 크기 기반으로 너무 커지지 않도록 제한
+        self.update_frequency = 256
 
         # Build actor and critic networks
         self.actor = self.build_actor()
@@ -142,30 +141,41 @@ class PPOAgent:
     # Action / Value
     # ---------------------------
     def get_action_probs(self, state, action_mask):
-        """
-        상태에서 액션 확률 분포 계산
-        - invalid action은 logits를 -1e9로 만들어 softmax 후 확률이 사실상 0이 되게 처리
-        - temperature 제거(=1.0) 및 과도한 클리핑 완화
-        """
-        logits = self.actor(state, training=False)  # (B, V, A)
+        # 1. 입력 차원 확인 (Vehicle State 기준)
+        v_state = state[0]
+        is_single_input = (v_state.ndim == 2)
 
-        # NaN/Inf -> 0
-        logits = tf.where(tf.math.is_finite(logits), logits, tf.zeros_like(logits))
-        # 과도한 제한은 학습 신호를 죽일 수 있어 완화된 클리핑만
-        logits = tf.clip_by_value(logits, -20.0, 20.0)
+        # 2. 단일 입력이면 배치 차원 추가
+        if is_single_input:
+            state_input = [np.expand_dims(s, axis=0) for s in state]
+            mask_input = np.expand_dims(action_mask, axis=0)
+        else:
+            state_input = state
+            mask_input = action_mask
 
-        # Mask: invalid logits -> very negative
-        neg_inf = tf.constant(-1e9, dtype=logits.dtype)
-        masked_logits = tf.where(tf.equal(action_mask, 1), logits, neg_inf)
+        # 3. 모델 예측 (Logits 계산)
+        # 모델 출력이 float16일 수 있으므로, 안전하게 float32로 캐스팅
+        logits = self.actor(state_input, training=False) 
+        logits = tf.cast(logits, dtype=tf.float32)
 
-        # Softmax
+        # 4. 마스킹 처리 (float32로 통일)
+        mask_tensor = tf.cast(mask_input, dtype=tf.float32)
+        
+        # 마스크가 0인(불가능한) 행동에 -1e9를 더함 (Softmax 결과 0 유도)
+        inf_mask = (1.0 - mask_tensor) * -1e9
+        
+        # 이제 둘 다 float32이므로 안전하게 더하기 가능
+        masked_logits = logits + inf_mask
+
+        # 5. Softmax 계산 (float32 권장)
         action_probs = tf.nn.softmax(masked_logits, axis=-1)
 
-        # 수치 안정: 0 방지(로그 계산용) + 재정규화
-        action_probs = tf.clip_by_value(action_probs, 1e-8, 1.0)
-        action_probs = action_probs / tf.reduce_sum(action_probs, axis=-1, keepdims=True)
+        # # 6. 단일 입력이었으면 결과의 배치 차원 제거
+        # if is_single_input:
+        #     action_probs = tf.squeeze(action_probs, axis=0)
+        #     masked_logits = tf.squeeze(masked_logits, axis=0)
 
-        return action_probs, logits
+        return action_probs, masked_logits
 
     def act(self, state, action_mask):
         action_probs, logits = self.get_action_probs(state, action_mask)
@@ -247,7 +257,8 @@ class PPOAgent:
             self.episode_buffer = []
 
     def should_train(self):
-        return len(self.trajectory_buffer) >= self.update_frequency
+        # 에피소드 버퍼 + 대기 중 trajectory 합산하여 학습 여부 판단
+        return (len(self.episode_buffer) + len(self.trajectory_buffer)) >= self.update_frequency
 
     # ---------------------------
     # Reward normalization (Welford)
@@ -335,11 +346,18 @@ class PPOAgent:
     # Training (FIXED: minibatch PPO, no extra ratio pre-clip, target_kl early stop, LR adapt)
     # ---------------------------
     def train(self):
+        # 에피소드 버퍼에 쌓인 데이터를 우선 trajectory_buffer로 이동
+        if len(self.episode_buffer) > 0:
+            self.trajectory_buffer.extend(self.episode_buffer)
+            self.episode_buffer = []
+
         if len(self.trajectory_buffer) < self.update_frequency:
             # 학습 스킵 시에도 상태 기록 (버퍼 크기 확인용)
+            current_size = len(self.trajectory_buffer)
+            total_buffer = len(self.episode_buffer) + current_size
             self.last_train_stats = {
-                "buffer_size": len(self.trajectory_buffer),
-                "trajectory_buffer_size": len(self.trajectory_buffer),
+                "buffer_size": total_buffer,
+                "trajectory_buffer_size": current_size,
                 "train_updates": 0,
                 "avg_kl": 0.0,
                 "actor_loss": 0.0,
@@ -353,20 +371,56 @@ class PPOAgent:
             return None
 
         batch = self.trajectory_buffer[:]
+
+        # # Extract arrays
+        # states = [
+        #     np.array([b[0][0] for b in batch], dtype=np.float32),  # vehicle states
+        #     np.array([b[0][1] for b in batch], dtype=np.float32),  # request states
+        #     np.array([b[0][2] for b in batch], dtype=np.float32),  # relation states
+        # ]
+        # next_states = [
+        #     np.array([b[3][0] for b in batch], dtype=np.float32),
+        #     np.array([b[3][1] for b in batch], dtype=np.float32),
+        #     np.array([b[3][2] for b in batch], dtype=np.float32),
+        # ]
+
+        try:
+            def safe_stack_and_squeeze(data_list):
+                """리스트를 적재하고 (Batch, 1, ...) 형태인 경우 1차원을 제거"""
+                arr = np.array(data_list, dtype=np.float32)
+                # 차원이 2 이상이고 두 번째 차원(axis=1)이 1이라면 제거
+                if arr.ndim > 1 and arr.shape[1] == 1:
+                    arr = np.squeeze(arr, axis=1)
+                return arr
+
+            # Current States
+            s_v = safe_stack_and_squeeze([b[0][0] for b in batch])   # Vehicle
+            s_r = safe_stack_and_squeeze([b[0][1] for b in batch])   # Request
+            s_rel = safe_stack_and_squeeze([b[0][2] for b in batch]) # Relation
+            states = [s_v, s_r, s_rel]
+
+            # Next States
+            ns_v = safe_stack_and_squeeze([b[3][0] for b in batch])
+            ns_r = safe_stack_and_squeeze([b[3][1] for b in batch])
+            ns_rel = safe_stack_and_squeeze([b[3][2] for b in batch])
+            next_states = [ns_v, ns_r, ns_rel]
+
+        except Exception as e:
+            print(f"\n[Critical Error] 데이터 전처리 중 오류 발생! 배치를 건너뜁니다.")
+            print(f"Error Details: {e}")
+            # 디버깅용 Shape 출력
+            try:
+                tmp_v = np.array([b[0][0] for b in batch])
+                print(f"Debug Info - Raw Vehicle Shape: {tmp_v.shape}")
+            except:
+                pass
+            
+            # 오류가 발생한 데이터는 학습에 사용할 수 없으므로 버퍼를 비워 무한 루프 방지
+            self.trajectory_buffer = []
+            return None
+
         self.trajectory_buffer = []
         buffer_size_used = len(batch)
-
-        # Extract arrays
-        states = [
-            np.array([b[0][0][0] for b in batch], dtype=np.float32),  # vehicle states
-            np.array([b[0][1][0] for b in batch], dtype=np.float32),  # request states
-            np.array([b[0][2][0] for b in batch], dtype=np.float32),  # relation states
-        ]
-        next_states = [
-            np.array([b[3][0][0] for b in batch], dtype=np.float32),
-            np.array([b[3][1][0] for b in batch], dtype=np.float32),
-            np.array([b[3][2][0] for b in batch], dtype=np.float32),
-        ]
 
         actions = np.array([[b[1][0], b[1][1]] for b in batch], dtype=np.int32)  # (N,2)
         rewards = np.array([b[2] for b in batch], dtype=np.float32)
@@ -523,7 +577,6 @@ class PPOAgent:
             self.last_kl = 0.0
             self.last_train_stats = {
                 "buffer_size": buffer_size_used,
-                "trajectory_buffer_size": buffer_size_used,
                 "train_updates": 0,
                 "avg_kl": 0.0,
                 "actor_loss": 0.0,
@@ -549,7 +602,6 @@ class PPOAgent:
         # Save last train stats for logging
         self.last_train_stats = {
             "buffer_size": buffer_size_used,
-            "trajectory_buffer_size": buffer_size_used,
             "train_updates": n_updates,
             "avg_kl": float(avg_kl),
             "actor_loss": float(avg_actor_loss),

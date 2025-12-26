@@ -2,6 +2,7 @@ import os
 import numpy as np
 import tensorflow as tf
 import app.config as cfg
+from app.action_type import ActionType
 from tensorflow.keras import mixed_precision
 
 from app.pending_buffer import PendingBuffer
@@ -54,6 +55,7 @@ class DDQNAgent:
         self.beta_start = 0.4
         self.beta_end = 1.0
         self.beta_target_episode = 4000  # 5000 ep의 80%
+        self.train_step_cnt = 0
 
     def save_model(self, file_path):
         self.model.save_weights(file_path)
@@ -103,40 +105,98 @@ class DDQNAgent:
 
         return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_scaled)
 
-    def act(self, state, action_mask):
-        info = {
-            'mode': None
-        }
-        # 유효한 액션 먼저 확인
-        valid_actions = tf.where(action_mask == 1)
-        if tf.shape(valid_actions)[0] == 0:
-            # 유효한 액션이 없는 경우 REJECT로 폴백
-            vehicle_idx = 0
-            action_idx = cfg.POSSIBLE_ACTION - 1
-            info['mode'] = 'fallback'
-            return [vehicle_idx, action_idx, info]
+    def get_action_q_values(self, state, action_mask):
+        # 1. 입력 차원 확인 (Vehicle State 기준)
+        v_state = state[0]
+        is_single_input = (v_state.ndim == 2)
 
-        if np.random.rand() < self.epsilon:
-            info['mode'] = 'explore'
-            rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
-            rand_action = valid_actions[rand_idx].numpy()
-            vehicle_idx = int(rand_action[0])
-            action_idx = int(rand_action[1])
+        # 2. 단일 입력이면 배치 차원 추가 (Batch=1)
+        if is_single_input:
+            state_input = [np.expand_dims(s, axis=0) for s in state]
+            mask_input = np.expand_dims(action_mask, axis=0)
         else:
-            info['mode'] = 'exploit'
-            q_values = self.model.predict(state, verbose=0)
-            # 무효 액션에 작은 값 할당(너무 큰 음수는 불필요한 수치문제 유발)
-            masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=q_values.dtype))
-            flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
-            vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
-            action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
-            # 최종 유효성 재검증
-            if action_mask[vehicle_idx][action_idx] != 1:
-                first_valid = valid_actions[0].numpy()
-                vehicle_idx = int(first_valid[0])
-                action_idx = int(first_valid[1])
-                info['mode'] = 'exploit_safe_fallback'
-        return [vehicle_idx, action_idx, info]
+            state_input = state
+            mask_input = action_mask
+
+        # 3. 모델 예측 (Q-Value 계산)
+        # mixed_precision 호환성을 위해 float32로 변환
+        q_values = self.model(state_input, training=False) 
+        q_values = tf.cast(q_values, dtype=tf.float32)
+
+        # 4. 마스킹 처리 (불가능한 행동 제외)
+        # mask가 0인 위치에 -1e9를 더해 Q값을 떨어뜨림 (Argmax에서 선택 안 되게)
+        mask_tensor = tf.cast(mask_input, dtype=tf.float32)
+        inf_mask = (1.0 - mask_tensor) * -1e9
+        
+        masked_q_values = q_values + inf_mask
+
+        # 5. 단일 입력이었으면 결과의 배치 차원 제거
+        if is_single_input:
+            masked_q_values = tf.squeeze(masked_q_values, axis=0)
+
+        return masked_q_values
+
+    def get_action_info(self, vehicle_idx, action_idx):
+        info = {}
+        
+        # 기본 인덱스 정보
+        info['v_idx'] = int(vehicle_idx)
+        info['action_idx'] = int(action_idx)
+
+        # Action 해석
+        # cfg.MAX_NUM_REQUEST (보통 12) 미만이면 승객 요청 처리
+        if action_idx < cfg.MAX_NUM_REQUEST:
+            # 1. 승객 처리 (일단 SERVE로 표시하거나 None으로 둠)
+            # 환경(env)에서 차량 상태(승객 탑승 여부)를 보고 PICKUP/DROPOFF로 바꿔줍니다.
+            info['type'] = "SERVE" 
+            info['r_id'] = int(action_idx) # 요청 슬롯 인덱스
+            
+        else:
+            # 2. 대기/거절 (마지막 인덱스)
+            info['type'] = ActionType.REJECT
+            info['r_id'] = None
+
+        return info
+    
+
+    def act(self, state, action_mask):
+        # 1. 탐험 (Exploration)
+        if np.random.rand() <= self.epsilon:
+            # 마스크가 1인(가능한) 행동 중에서 무작위 선택
+            # action_mask shape: (Vehicle, Action) -> Flatten
+            flat_mask = action_mask.flatten()
+            available_indices = np.where(flat_mask == 1)[0]
+            
+            if len(available_indices) == 0:
+                # 비상시 (이론상 없어야 함)
+                return [0, 0, self.get_action_info(0, 0)]
+            
+            flat_action_idx = np.random.choice(available_indices)
+        
+        # 2. 활용 (Exploitation)
+        else:
+            # Q-Value 계산 (위에서 수정한 함수 사용)
+            q_values = self.get_action_q_values(state, action_mask)
+            
+            # (Vehicle, Action) -> (V*A) Flatten
+            flat_q_values = tf.reshape(q_values, [-1])
+            
+            # Argmax로 최대 Q값을 가진 인덱스 찾기 (Tensor)
+            flat_action_tensor = tf.argmax(flat_q_values)
+
+            # [핵심] Tensor -> CPU Int 변환 (JIT 오류 회피)
+            try:
+                flat_action_idx = int(flat_action_tensor.numpy())
+            except AttributeError:
+                flat_action_idx = int(flat_action_tensor)
+
+        # 3. 순수 파이썬 연산으로 인덱스 분해
+        num_actions = int(cfg.POSSIBLE_ACTION)
+        
+        action_idx = flat_action_idx % num_actions
+        vehicle_idx = flat_action_idx // num_actions
+
+        return [vehicle_idx, action_idx, self.get_action_info(vehicle_idx, action_idx)]
 
     def decay_epsilon(self):
         if self.epsilon > self.epsilon_min:
@@ -209,157 +269,132 @@ class DDQNAgent:
             return None
 
         try:
-            # PER: batch, idxs, is_weights 반환
-            result = self.replay_buffer.sample(self.batch_size)
-            if result is None:
+            sample_result = self.replay_buffer.sample(self.batch_size)
+            if sample_result is None:
                 return None
-            batch, idxs, is_weights = result
+            # PrioritizedReplayBuffer.sample returns (batch, idxs, is_weights)
+            batch, idxs, is_weights = sample_result
+        except Exception as e:
+            print(f"[DDQN Error] 샘플링 실패: {e}")
+            return None
 
-            # === Q(s', a') with numerical stability ===
-            next_vehicle_tensor = np.array([b[3][0][0] for b in batch], dtype=np.float32)
-            next_request_tensor = np.array([b[3][1][0] for b in batch], dtype=np.float32)
-            next_relation_tensor = np.array([b[3][2][0] for b in batch], dtype=np.float32)
+        try:
+            # --- [Step 1] 데이터 전처리 (방어적 코딩) ---
+            def safe_squeeze(data_list):
+                arr = np.array(data_list, dtype=np.float32)
+                if arr.ndim > 1 and arr.shape[1] == 1:
+                    arr = np.squeeze(arr, axis=1)
+                return arr
 
-            # Clean inputs
-            next_vehicle_tensor = np.nan_to_num(next_vehicle_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
-            next_request_tensor = np.nan_to_num(next_request_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
-            next_relation_tensor = np.nan_to_num(next_relation_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
+            # State가 None인 경우 방지
+            if any(b[0] is None for b in batch):
+                # print(f"[DDQN Error] None State detected inside batch. Skipping.")
+                return 0.0
 
-            next_states = [next_vehicle_tensor, next_request_tensor, next_relation_tensor]
+            s_v = safe_squeeze([b[0][0] for b in batch])
+            s_r = safe_squeeze([b[0][1] for b in batch])
+            s_rel = safe_squeeze([b[0][2] for b in batch])
+            states = [s_v, s_r, s_rel]
 
-            # === Double DQN Implementation ===
-            # Step 1: Main Network로 액션 선택
-            next_q_main = self.model.predict(next_states, verbose=0)
-            next_q_main = tf.where(tf.math.is_finite(next_q_main), next_q_main, tf.zeros_like(next_q_main))
-            next_q_main = tf.clip_by_value(next_q_main, -5.0, 5.0)
+            ns_v = safe_squeeze([b[3][0] for b in batch])
+            ns_r = safe_squeeze([b[3][1] for b in batch])
+            ns_rel = safe_squeeze([b[3][2] for b in batch])
+            next_states = [ns_v, ns_r, ns_rel]
             
-            next_action_mask = np.array([b[5]['nm'] for b in batch])
-            masked_next_q_main = tf.where(next_action_mask == 1, next_q_main, tf.constant(-1e1, dtype=next_q_main.dtype))
+            action_masks = np.array([b[5]["m"] for b in batch], dtype=np.float32)
             
-            # Main Network에서 최적 액션 선택
-            max_indices = tf.argmax(tf.reshape(masked_next_q_main, (self.batch_size, -1)), axis=1)
-            # GPU 친화적 연산: FloorMod 대신 floordiv와 수동 계산 (타입 일치 유지)
-            max_indices_int64 = tf.cast(max_indices, dtype=tf.int64)
-            possible_action_int64 = tf.constant(cfg.POSSIBLE_ACTION, dtype=tf.int64)
-            vehicle_indices_int64 = tf.math.floordiv(max_indices_int64, possible_action_int64)
-            action_indices_int64 = max_indices_int64 - vehicle_indices_int64 * possible_action_int64
-            # 최종적으로 int32로 변환
-            vehicle_indices = tf.cast(vehicle_indices_int64, dtype=tf.int32)
-            action_indices = tf.cast(action_indices_int64, dtype=tf.int32)
-            
-            # Step 2: Target Network로 선택된 액션 평가
-            next_q_target = self.target_model.predict(next_states, verbose=0)
-            next_q_target = tf.where(tf.math.is_finite(next_q_target), next_q_target, tf.zeros_like(next_q_target))
-            next_q_target = tf.clip_by_value(next_q_target, -5.0, 5.0)
-            
-            # 선택된 액션의 Target Network 값 추출
-            batch_indices = tf.range(self.batch_size, dtype=tf.int32)
-            selected_indices = tf.stack([batch_indices, vehicle_indices, action_indices], axis=1)
-            max_next_q = tf.gather_nd(next_q_target, selected_indices)
-            
-            max_next_q = np.nan_to_num(max_next_q, nan=0.0, posinf=5.0, neginf=-5.0)
-            max_next_q = np.clip(max_next_q, -5.0, 5.0)
+            # =========================================================
+            # [핵심 수정] Action이 int로 오염되었을 경우 처리
+            # =========================================================
+            action_list = []
+            for i, item in enumerate(batch):
+                raw_action = item[1] # b[1]
+                
+                # 정상 케이스: 리스트/튜플/배열이고 길이가 2 이상
+                if isinstance(raw_action, (list, tuple, np.ndarray)) and len(raw_action) >= 2:
+                    action_list.append([int(raw_action[0]), int(raw_action[1])])
+                else:
+                    # 오염된 케이스: int형이거나 잘못된 포맷
+                    # print(f"[DDQN Error] Batch[{i}] 잘못된 Action 포맷: {raw_action} (Type: {type(raw_action)}) -> [0, 0]으로 대체")
+                    action_list.append([0, 0]) # 더미 액션으로 대체하여 학습 계속 진행
+
+            actions = np.array(action_list, dtype=np.int32)
+            # =========================================================
 
             rewards = np.array([b[2] for b in batch], dtype=np.float32)
             dones = np.array([b[4] for b in batch], dtype=np.float32)
-            rewards = np.nan_to_num(rewards, nan=0.0, posinf=5.0, neginf=-5.0)
-            rewards = np.clip(rewards, -5.0, 5.0)
+            is_weights_tensor = tf.convert_to_tensor(is_weights, dtype=tf.float32)
 
-            targets = rewards + self.gamma * max_next_q * (1 - dones)
-            targets = np.nan_to_num(targets, nan=0.0, posinf=5.0, neginf=-5.0)
-            targets = np.clip(targets, -5.0, 5.0)
+            # --- [Step 2] 학습 진행 ---
+            # 2-1. Target 계산
+            next_q_main = self.model(next_states, training=False)
+            inf_mask = (1.0 - action_masks) * -1e9
+            masked_next_q = next_q_main + inf_mask
+            
+            batch_size = tf.shape(next_q_main)[0]
+            flat_next_q = tf.reshape(masked_next_q, [batch_size, -1])
+            max_action_indices = tf.argmax(flat_next_q, axis=1, output_type=tf.int32)
 
-            # === Q(s, a) with numerical stability ===
-            vehicle_tensor = np.array([b[0][0][0] for b in batch], dtype=np.float32)
-            request_tensor = np.array([b[0][1][0] for b in batch], dtype=np.float32)
-            relation_tensor = np.array([b[0][2][0] for b in batch], dtype=np.float32)
+            next_q_target = self.target_model(next_states, training=False)
+            flat_target_q = tf.reshape(next_q_target, [batch_size, -1])
+            
+            batch_indices = tf.range(batch_size, dtype=tf.int32)
+            gather_indices = tf.stack([batch_indices, max_action_indices], axis=1)
+            max_next_q_val = tf.gather_nd(flat_target_q, gather_indices)
 
-            vehicle_tensor = np.nan_to_num(vehicle_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
-            request_tensor = np.nan_to_num(request_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
-            relation_tensor = np.nan_to_num(relation_tensor, nan=0.0, posinf=5.0, neginf=-5.0)
+            target_q = rewards + (1.0 - dones) * self.gamma * max_next_q_val
+            target_q = tf.stop_gradient(target_q)
 
-            states = [vehicle_tensor, request_tensor, relation_tensor]
-
+            # 2-2. Gradient Descent
             with tf.GradientTape() as tape:
                 q_values = self.model(states, training=True)
-                q_values = tf.where(tf.math.is_finite(q_values), q_values, tf.zeros_like(q_values))
-                q_values = tf.clip_by_value(q_values, -5.0, 5.0)
-
-                action_mask = np.array([b[5]['m'] for b in batch])
-                masked_q_values = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=q_values.dtype))
-
-                actions_raw = np.array([b[1] for b in batch])
-                actions = actions_raw[:, :2]
-                indices = tf.constant(actions, dtype=tf.int32)
-                batch_indices = tf.range(tf.shape(indices)[0], dtype=tf.int32)[:, tf.newaxis]
-                full_indices = tf.concat([batch_indices, indices], axis=1)
-
-                q_sa = tf.gather_nd(masked_q_values, full_indices)
-                q_sa = tf.where(tf.math.is_finite(q_sa), q_sa, tf.zeros_like(q_sa))
-                q_sa = tf.clip_by_value(q_sa, -5.0, 5.0)
-
-                # Huber loss (more robust than MSE) - dtype 일치 유지
-                targets_tf = tf.convert_to_tensor(targets, dtype=q_sa.dtype)
-                diff = targets_tf - q_sa
-                diff = tf.where(tf.math.is_finite(diff), diff, tf.zeros_like(diff))
-                diff = tf.clip_by_value(diff, -10.0, 10.0)
-                td_errors = diff  # PER: TD-error 저장 (TF 텐서)
-
-                huber_delta = tf.cast(0.5, dtype=diff.dtype)
-                abs_diff = tf.abs(diff)
-                is_small = abs_diff <= huber_delta
-                small_loss = tf.cast(0.5, diff.dtype) * tf.square(diff)
-                large_loss = huber_delta * abs_diff - tf.cast(0.5, diff.dtype) * huber_delta * huber_delta
-                huber_loss = tf.where(is_small, small_loss, large_loss)
                 
-                # PER: Importance Sampling Weights 적용 (dtype 정합)
-                is_weights_tensor = tf.convert_to_tensor(is_weights, dtype=huber_loss.dtype)
+                v_indices = actions[:, 0]
+                a_indices = actions[:, 1]
+                
+                shape_q = tf.shape(q_values)
+                num_acts = shape_q[2]
+                
+                flat_act_indices = v_indices * num_acts + a_indices
+                flat_q_values = tf.reshape(q_values, [batch_size, -1])
+                gather_indices_main = tf.stack([batch_indices, flat_act_indices], axis=1)
+                
+                main_q_val = tf.gather_nd(flat_q_values, gather_indices_main)
+
+                td_errors = target_q - main_q_val
+                huber_loss = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.NONE)(target_q, main_q_val)
                 weighted_loss = huber_loss * is_weights_tensor
-                raw_loss = tf.reduce_mean(weighted_loss)
-                loss = raw_loss * 0.1  # scale down
+                loss = tf.reduce_mean(weighted_loss)
+                
+                if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+                    scaled_loss = self.optimizer.get_scaled_loss(loss)
+                else:
+                    scaled_loss = loss
 
-                if tf.math.is_nan(loss):
-                    print("[Warning] Loss is NaN! Forcing 0.0")
-                    return 0.0
-
-            # Mixed precision: scale/unscale gradients if 적용됨
-            try:
-                scaled_loss = self.optimizer.get_scaled_loss(loss)
+            # 2-3. Apply Gradients
+            if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
                 grads = tape.gradient(scaled_loss, self.model.trainable_variables)
                 grads = self.optimizer.get_unscaled_gradients(grads)
-            except Exception:
+            else:
                 grads = tape.gradient(loss, self.model.trainable_variables)
-            if grads is not None:
-                safe_grads = []
-                for grad in grads:
-                    if grad is not None:
-                        g = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
-                        g = tf.clip_by_norm(g, 1.0)
-                        safe_grads.append(g)
-                    else:
-                        safe_grads.append(None)
-                pairs = [(g, v) for g, v in zip(safe_grads, self.model.trainable_variables) if g is not None]
-                if pairs:
-                    self.optimizer.apply_gradients(pairs)
 
-            self.train_step += 1
-            if self.train_step % self.update_target_freq == 0:
-                self.target_model.set_weights(self.model.get_weights())
+            grads = [tf.clip_by_norm(g, 1.0) for g in grads]
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
 
-            # PER: 우선순위 업데이트 (numpy로 변환하여 안전하게 저장)
-            td_errors_np = td_errors.numpy().astype(np.float32)
+            # --- [Step 3] 후처리 ---
+            td_errors_np = tf.abs(td_errors).numpy().astype(np.float32)
             self.replay_buffer.update_priorities(idxs, td_errors_np)
-
-            # 명시적 메모리 해제 (GPU OOM 방지)
-            loss_value = float(loss.numpy())
-            del batch, next_states, states, next_q_main, next_q_target
-            del q_values, masked_q_values, masked_next_q_main
-            del vehicle_tensor, request_tensor, relation_tensor
-            del next_vehicle_tensor, next_request_tensor, next_relation_tensor
-            del td_errors, is_weights_tensor
             
-            return loss_value
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
+                
+            self.train_step_cnt += 1
+            if self.train_step_cnt % self.update_target_freq == 0:
+                self.target_model.set_weights(self.model.get_weights())
+                
+            return float(loss.numpy())
 
         except Exception as e:
-            print(f"[Error] Training failed: {e}")
+            # 에러 발생 시 건너뜀 (프로그램 종료 방지)
+            print(f"[DDQN Error] 학습 중 오류 발생: {e}")
             return 0.0

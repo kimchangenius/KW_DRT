@@ -232,14 +232,19 @@ class RideSharingEnvironment:
             for v in self.vehicle_list:
                 to_remove = []
                 for r in v.active_request_list:
-                    if r.status == RequestStatus.CANCELLED:
-                        to_remove.append(r)
-                        # Pickup 실패 지연보상 부여
+                    if v.target_request in cancelled_list:
+                        v.status = VehicleStatus.IDLE
+                        v.target_request = None
+                        v.target_arrival_time = -1
+                    
+                    request_to_remove = [r for r in v.active_request_list if r in cancelled_list]
+
+                    for r in request_to_remove:
+                        v.active_request_list.remove(r)
+
+                        # 지연 보상
                         p_action_id = "{}_1".format(r.id)
                         d_reward_list.append([p_action_id, -1])
-                for r in to_remove:
-                    if r in v.active_request_list:
-                        v.active_request_list.remove(r)
 
         for idx, r in enumerate(self.active_request_list):
             r.slot_idx = idx
@@ -247,43 +252,69 @@ class RideSharingEnvironment:
         return d_reward_list, [r.id for r in cancelled_list]
 
 
-    # 기존에 가진 자료구조들을 토대로 state 형태로 만들어주기만 하는 역할
-    # 이 안에서 상태가 바뀌거나 업데이트가 되어서는 안됨
-    def sync_state(self):
-        # Vehicle State 생성
-        all_list = []
+    def get_vehicle_state(self):
+        state_list = []
         for v in self.vehicle_list:
-            all_list.append(v.get_vector())
-        self.vehicle_state = np.array(all_list, dtype=np.float32)
-        # print(self.vehicle_state)
-        # print(self.vehicle_state.shape)
-        # print(self.vehicle_state.dtype)
+            vec = v.get_vector() # vehicle.py의 메소드 사용
+            state_list.append(vec)
 
-        # Request State 생성
-        all_list = []
-        for idx, r in enumerate(self.active_request_list):
+        feat_dim = cfg.VEHICLE_INPUT_DIM
+        if len(state_list) > 0:
+            state_arr = np.array(state_list, dtype=np.float32)
+        else:
+            state_arr = np.zeros((0, feat_dim), dtype=np.float32)
+        
+        # Padding / Truncate
+        target_len = cfg.MAX_NUM_VEHICLES
+        curr_len = state_arr.shape[0]
+
+        if curr_len < target_len:
+            padding = np.zeros((target_len - curr_len, feat_dim), dtype=np.float32)
+            state_arr = np.vstack([state_arr, padding]) if curr_len > 0 else padding
+        elif curr_len > target_len:
+            state_arr = state_arr[:target_len]
+            
+        return state_arr
+
+    def get_request_state(self):
+       # 1. 대상 요청 목록 수집 (기존 로직: active_request_list 사용)
+        # 학습 안정성을 위해 ID 순 정렬을 권장하지만, 기존 로직 그대로 유지합니다.
+        target_list = self.active_request_list
+        
+        state_list = []
+        for idx, r in enumerate(target_list):
             if idx >= cfg.MAX_NUM_REQUEST:
                 break
-            all_list.append(r.get_vector())
+            vec = r.get_vector()
+            state_list.append(vec)
 
-        missing = cfg.MAX_NUM_REQUEST - len(all_list)
-        if missing > 0:
-            zero_vec = [0.0] * cfg.REQUEST_INPUT_DIM
-            all_list.extend([zero_vec] * missing)
+        # 2. Numpy 변환
+        feat_dim = cfg.REQUEST_INPUT_DIM
+        if len(state_list) > 0:
+            state_arr = np.array(state_list, dtype=np.float32)
+        else:
+            state_arr = np.zeros((0, feat_dim), dtype=np.float32)
 
-        assert len(all_list) == cfg.MAX_NUM_REQUEST, "MAX_NUM_REQUEST mismatch"
-        self.request_state = np.array(all_list, dtype=np.float32)
-        # print(self.request_state)
-        # print(self.request_state.shape)
-        # print(self.request_state.dtype)
+        # 3. Padding / Truncate (MAX_NUM_REQUEST에 맞춤)
+        target_len = cfg.MAX_NUM_REQUEST
+        curr_len = state_arr.shape[0]
 
-        # Relation State 생성
-        all_list = []
+        if curr_len < target_len:
+            padding = np.zeros((target_len - curr_len, feat_dim), dtype=np.float32)
+            state_arr = np.vstack([state_arr, padding]) if curr_len > 0 else padding
+        elif curr_len > target_len:
+            state_arr = state_arr[:target_len]
+
+        return state_arr
+
+    def get_relation_state(self):
+        target_requests = self.active_request_list[:cfg.MAX_NUM_REQUEST]
+        
+        relation_list = []
+        
         for v in self.vehicle_list:
             v_list = []
-            for idx, r in enumerate(self.active_request_list):
-                if idx >= cfg.MAX_NUM_REQUEST:
-                    break
+            for r in target_requests:
                 need_drop_off = 0
                 if r in v.active_request_list:
                     need_drop_off = 1
@@ -294,26 +325,48 @@ class RideSharingEnvironment:
                     dur = self.network.get_duration(v.curr_node, r.to_node_id)
                 else:
                     dur = 0
-                dur = dur / self.network.max_duration
+                
+                # 정규화
+                if self.network.max_duration > 0:
+                    dur = dur / self.network.max_duration
+                
                 vec = [need_drop_off, dur]
                 v_list.append(vec)
-
+            
+            # Request 차원 Padding (Inner Loop)
+            # 현재 차량에 대해 요청 개수가 MAX보다 적으면 0으로 채움
             missing = cfg.MAX_NUM_REQUEST - len(v_list)
             if missing > 0:
                 zero_vec = [0.0] * cfg.RELATION_INPUT_DIM
                 v_list.extend([zero_vec] * missing)
+            
+            relation_list.append(v_list)
 
-            all_list.append(v_list)
-        self.relation_state = np.array(all_list, dtype=np.float32)
-        # print(self.relation_state)
-        # print(self.relation_state.shape)
-        # print(self.relation_state.dtype)
+        max_v = cfg.MAX_NUM_VEHICLES
+        max_r = cfg.MAX_NUM_REQUEST
+        feat_dim = cfg.RELATION_INPUT_DIM
 
-        self.state = [
-            np.expand_dims(self.vehicle_state, axis=0),
-            np.expand_dims(self.request_state, axis=0),
-            np.expand_dims(self.relation_state, axis=0)
-        ]
+        final_rel = np.zeros((max_v, max_r, feat_dim), dtype=np.float32)
+        
+        if len(relation_list) > 0:
+            temp_rel = np.array(relation_list, dtype=np.float32)
+            
+            curr_v = min(temp_rel.shape[0], max_v)
+            final_rel[:curr_v, :, :] = temp_rel[:curr_v, :, :]
+
+        return final_rel
+
+
+    # 기존에 가진 자료구조들을 토대로 state 형태로 만들어주기만 하는 역할
+    # 이 안에서 상태가 바뀌거나 업데이트가 되어서는 안됨
+    def sync_state(self):
+        # 1. 고정된 크기의 각 상태 가져오기
+        vehicle_state = self.get_vehicle_state()
+        request_state = self.get_request_state()
+        relation_state = self.get_relation_state()
+
+        # 2. 전체 상태 조립
+        self.state = [vehicle_state, request_state, relation_state]
 
     def get_action_mask(self):
         """
@@ -377,6 +430,11 @@ class RideSharingEnvironment:
         vehicle_idx = action[0]
         action_idx = action[1]
         v = self.vehicle_list[vehicle_idx]
+        # 유효하지 않은 요청 인덱스가 선택되면 안전하게 REJECT로 폴백
+        if action_idx >= len(self.active_request_list):
+            action_idx = cfg.POSSIBLE_ACTION - 1
+            action[1] = action_idx
+
         if action_idx == cfg.POSSIBLE_ACTION - 1:
             action[2]['r_id'] = ""
             action[2]['type'] = ActionType.REJECT
