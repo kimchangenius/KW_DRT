@@ -14,3 +14,4 @@ trash/*
 tuning.txt
 train_result/*
 sim_result/*
+app/__pycache__/
