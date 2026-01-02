@@ -19,6 +19,7 @@ import app.config as cfg
 from pprint import pprint
 from app.env_builder import EnvBuilder
 from app.ddqn_agent import DDQNAgent
+from app.dqn_logger import log_dqn_metrics
 from app.ppo_agent import PPOAgent
 from app.ppo_logger import log_ppo_metrics
 from app.mappo_agent import MAPPOAgent
@@ -74,6 +75,10 @@ CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
 RESULT_PATH = os.path.join(CURR_PATH, 'result')
 
+# LLM 설정 (config 기반)
+USE_LLM_ASSIST = cfg.LLM_ENABLED
+LLM_CONSTRAINTS = "용량<=max, 시간창 준수, detour/대기 최소화"
+LLM_STEP_INTERVAL = cfg.LLM_STEP_INTERVAL  # N 스텝마다 LLM 사용
 
 def log_episode(path, info):
     ep = info['episode']
@@ -82,9 +87,16 @@ def log_episode(path, info):
     filepath = os.path.join(path, filename)
     with open(filepath, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Vehicle ID', 'Num. Accept', 'Num. Serve', 'On-Service Driving Time', 'Idle Time'])
+        writer.writerow(['Vehicle ID', 'Num. Accept', 'Num. Serve', 'On-Service Driving Time', 'Idle Time', 'Occupancy'])
         for v in drt_info_list:
-            curr_row = [v['id'], v['num_accept'], v['num_serve'], v['on_service_driving_time'], v['idle_time']]
+            curr_row = [
+                v['id'],
+                v['num_accept'],
+                v['num_serve'],
+                v['on_service_driving_time'],
+                v['idle_time'],
+                v.get('occupancy', 0.0)
+            ]
             writer.writerow(curr_row)
 
     req_info_list = info['request_info']
@@ -112,7 +124,7 @@ def log_all_episodes(path, info_list, total_time):
     with open(filepath, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Episode', 'Total Reward', 'Total Loss', 'Total Num. Accept', 'Total Num. Serve',
-                         'Mean Waiting Time', 'Mean In-Vehicle Time', 'Mean Detour Time'])
+                         'Mean Waiting Time', 'Mean In-Vehicle Time', 'Mean Detour Time', 'Mean Occupancy'])
         for e in info_list:
             curr_row = [
                 e['episode'],
@@ -122,7 +134,8 @@ def log_all_episodes(path, info_list, total_time):
                 e['total_num_serve'],
                 f"{e['mean_waiting_time']:.2f}",
                 f"{e['mean_in_vehicle_time']:.2f}",
-                f"{e['mean_detour_time']:.2f}"
+                f"{e['mean_detour_time']:.2f}",
+                f"{e.get('mean_occupancy', 0.0):.2f}"
             ]
             writer.writerow(curr_row)
     filename = 'episodes_time.txt'
@@ -161,7 +174,7 @@ def get_run_folder_name(config):
 def train_ddqn(env_builder, config, write_result=False, load_model=False):
     episodes = 500
     update_freq = 10
-    final_train_steps = 5
+    final_train_steps = 10
 
     config_str = ", ".join(f"{k}={v}" for k, v in config.items())
     print(f"\n<<<< Training Session: {config_str} >>>>")
@@ -178,6 +191,13 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
         run_name = get_run_folder_name(dqn_config)
         run_path = os.path.join(RESULT_PATH, "dqn_" + run_name)
         os.makedirs(run_path, exist_ok=True)
+        # 이전 실행 로그가 남지 않도록 DQN 로그 파일 초기화
+        dqn_log_path = os.path.join(run_path, "dqn_train_log.csv")
+        if os.path.exists(dqn_log_path):
+            try:
+                os.remove(dqn_log_path)
+            except PermissionError:
+                print(f"[Warn] 기존 DQN 로그 파일을 삭제하지 못했습니다: {dqn_log_path}")
 
     env = env_builder.build()
     agent = DDQNAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
@@ -193,16 +213,22 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
     e_info_list = []
     best_reward = float('-inf')
     total_time = 0.0
+    # 에피소드별 추가 로깅용 변수
+    gamma = 0.99
 
     for ep in range(1, episodes + 1):
         # print('\n============ Ep : {} ============'.format(ep))
         total_loss = 0.0
         total_reward = 0.0
+        q_sum = 0.0
+        q_count = 0
+        episode_discounted_return = 0.0
+        step_in_ep = 0
         state = env.reset()
         state = sanitize_state(state)
 
         # DDQN 학습률 업데이트
-        agent.update_learning_rate(ep)
+        # agent.update_learning_rate(ep)
 
         delayed_reward_confirm = 0
 
@@ -216,9 +242,30 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
             # env.print_active_requests()
 
             while env.has_idle_vehicle():
+                # 활성 요청이 없으면 액션을 선택하지 않고 시간 진행으로 넘김
+                if len(env.active_request_list) == 0:
+                    break
+
                 # print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
 
                 action_mask = env.get_action_mask()
+                # LLM은 탐험 구간에서만, 설정한 스텝 간격에 따라 사용
+                # use_llm_now = (
+                #     USE_LLM_ASSIST
+                #     and (env.curr_step % LLM_STEP_INTERVAL == 0)
+                #     and (np.random.rand() <= agent.epsilon)
+                # )
+                # if use_llm_now:
+                #     action = agent.act_with_llm(
+                #         env=env,
+                #         state=state,c
+                #         action_mask=action_mask,
+                #         priority="대기시간 최소화 > 시간창 준수 > 승차율",
+                #         constraints=LLM_CONSTRAINTS,
+                #         task="recommend",
+                #     )
+                # else:
+                #    action = agent.act(state, action_mask)
                 action = agent.act(state, action_mask)
                 env.enrich_action(action)
 
@@ -239,6 +286,14 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
 
                 transition = [state, action, reward, next_state, False, t_info]
                 transition_id += 1
+                # Q-value 평균 계산용: 현재 상태에서 선택된 액션의 Q를 accumulate
+                try:
+                    q_values = agent.get_action_q_values(state, action_mask)
+                    q_val = float(q_values[action[0], action[1]])
+                    q_sum += q_val
+                    q_count += 1
+                except Exception:
+                    pass
                 if info['is_pending'] is True:
                     print(f"[Debug] Step {env.curr_step}: Pending Buffer에 추가 - {action[2]['r_id']}")
                     agent.pending(transition)
@@ -267,6 +322,9 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                     print(f"[Debug] Step {env.curr_step}: Vehicle {action[0]} -> {action[2]['type']} (Request {action[2]['r_id']})")
 
                 total_reward += reward
+                # 할인 보상 누적
+                episode_discounted_return += (gamma ** step_in_ep) * reward
+                step_in_ep += 1
                 state = next_state
 
             env.curr_time += 1
@@ -284,6 +342,45 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
             for rid in cancelled_request_ids:
                 agent.pending_buffer.cancel(f"{rid}_1")  # PICKUP
                 agent.pending_buffer.cancel(f"{rid}_2")  # DROPOFF
+                # 해당 요청을 수락한 차량 상태도 정리
+                for v in env.vehicle_list:
+                    # 타겟이 취소된 요청이면 즉시 해제
+                    if getattr(v, "target_request", None) is not None and str(v.target_request.id) == str(rid):
+                        v.status = VehicleStatus.IDLE
+                        v.target_request = None
+                        v.target_arrival_time = -1
+                        v.next_node = 0
+                    # active_request_list에서 제거
+                    v.active_request_list = [r for r in v.active_request_list if str(r.id) != str(rid)]
+
+            # PendingBuffer에 남아 있지만 더 이상 active/done에 없는 요청 정리 (누적 방지)
+            if len(agent.pending_buffer) > 0:
+                valid_rids = {str(r.id) for r in env.active_request_list + env.done_request_list}
+                to_cancel = []
+                for action_id in list(agent.pending_buffer.pending.keys()):
+                    req_id = action_id.split("_")[0]
+                    if req_id not in valid_rids:
+                        to_cancel.append(action_id)
+                for action_id in to_cancel:
+                    agent.pending_buffer.cancel(action_id)
+                    # 차량 상태도 함께 정리
+                    for v in env.vehicle_list:
+                        if getattr(v, "target_request", None) is not None and str(v.target_request.id) == req_id:
+                            v.status = VehicleStatus.IDLE
+                            v.target_request = None
+                            v.target_arrival_time = -1
+                            v.next_node = 0
+                        v.active_request_list = [r for r in v.active_request_list if str(r.id) != req_id]
+
+            # 모든 요청이 소진되었는데 pending이 남았다면 강제로 정리해 에피소드 종료 유도
+            if len(env.active_request_list) == 0 and len(env.future_request_list) == 0 and len(agent.pending_buffer) > 0:
+                print("[세이프가드] 남은 요청 없음 + Pending 잔여 -> Pending 강제 정리")
+                agent.pending_buffer.clear()
+                for v in env.vehicle_list:
+                    v.status = VehicleStatus.IDLE
+                    v.target_request = None
+                    v.target_arrival_time = -1
+                    v.next_node = 0
 
             if env.is_done():
                 # 마지막 transition의 done을 True로 변경
@@ -334,16 +431,22 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                 req_info_list = []
                 total_num_accept = 0
                 total_num_serve = 0
+                total_occupancy = 0.0
                 for v in env.vehicle_list:
                     total_num_accept += v.num_accept
                     total_num_serve += v.num_serve
                     v.on_service_driving_time = env.curr_time - v.idle_time
+                    occ = 0.0
+                    if hasattr(v, "occupancy_sum") and hasattr(v, "occupancy_cnt") and v.occupancy_cnt > 0:
+                        occ = v.occupancy_sum / v.occupancy_cnt
+                    total_occupancy += occ
                     v_info = {
                         'id': v.id,
                         'num_accept': v.num_accept,
                         'num_serve': v.num_serve,
                         'idle_time': v.idle_time,
-                        'on_service_driving_time': v.on_service_driving_time
+                        'on_service_driving_time': v.on_service_driving_time,
+                        'occupancy': occ,
                     }
                     drt_info_list.append(v_info)
 
@@ -383,12 +486,12 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                     mean_waiting_time = 0.0
                     mean_in_vehicle_time = 0.0
                     mean_detour_time = 0.0
+                mean_occupancy = total_occupancy / len(env.vehicle_list) if len(env.vehicle_list) > 0 else 0.0
 
-                # 성능 추적 정보 추가 (PER 정보 포함)
+                # 성능 추적 정보 추가
                 recent_avg = sum(agent.recent_rewards[-5:]) / 5 if len(agent.recent_rewards) >= 5 else total_reward
-                per_beta = agent.replay_buffer.beta
-                print('====== Ep: {} / Reward: {} / Loss: {} / eps: {:.4f} / LR: {:.6f} / Avg5: {:.2f} / PER-beta: {:.3f} ======'.format(
-                    ep, total_reward, total_loss, agent.epsilon, agent.current_learning_rate, recent_avg, per_beta))
+                print('====== Ep: {} / Reward: {} / Loss: {} / eps: {:.4f} / LR: {:.6f} / Avg5: {:.2f} ======'.format(
+                    ep, total_reward, total_loss, agent.epsilon, agent.current_learning_rate, recent_avg))
 
                 # 파일 저장은 전체 정보 사용
                 e_info_full = {
@@ -400,6 +503,7 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                     'mean_waiting_time': mean_waiting_time,
                     'mean_in_vehicle_time': mean_in_vehicle_time,
                     'mean_detour_time': mean_detour_time,
+                    'mean_occupancy': mean_occupancy,
                     'event_sequence': env.event_sequences if hasattr(env, 'event_sequences') else [],
                     'drt_info': drt_info_list,
                     'request_info': req_info_list
@@ -416,15 +520,25 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                     'total_num_serve': total_num_serve,
                     'mean_waiting_time': mean_waiting_time,
                     'mean_in_vehicle_time': mean_in_vehicle_time,
-                    'mean_detour_time': mean_detour_time
+                    'mean_detour_time': mean_detour_time,
+                    'mean_occupancy': mean_occupancy
                 }
                 e_info_list.append(e_info_summary)
+
+                # DQN 학습 로그 기록
+                if write_result is True:
+                    avg_q = (q_sum / q_count) if q_count > 0 else 0.0
+                    metrics = {
+                        "avg_q": avg_q,
+                        "episode_length": step_in_ep,
+                        "discounted_return": episode_discounted_return,
+                    }
+                    log_dqn_metrics(run_path, ep, metrics)
 
                 # Save Model
                 if total_reward > best_reward:
                     best_reward = total_reward
                     if write_result is True:
-                        # DQN 전용 config 사용
                         model_name = "{}.h5".format(get_run_folder_name(dqn_config))
                         model_path = os.path.join(RESULT_PATH, model_name)
                         agent.save_model(model_path)
@@ -433,6 +547,12 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
 
             env.sync_state()
             state = env.state
+
+            # 스텝 하드캡(세이프가드): 무한 루프 방지
+            if cfg.ENABLE_SAFEGUARD and env.curr_step >= cfg.MAX_STEPS_CAP:
+                print(f"[세이프가드] 스텝 하드캡 도달({cfg.MAX_STEPS_CAP}) → 에피소드 강제 종료")
+                env.active_request_list = []
+                env.future_request_list = []
 
         end_time = time.time()
         progress_time = end_time - start_time
@@ -450,8 +570,9 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                 print(f"[Info] 세션 정리 스킵: {e}")
 
         # 적응형 Epsilon 감소 (성능 기반)
-        agent.adaptive_epsilon_decay(total_reward)
-        
+        #agent.adaptive_epsilon_decay(total_reward)
+        agent.decay_epsilon()
+
         # GPU 메모리 정리 (10 에피소드마다 - OOM 방지 강화)
         if ep % 10 == 0:
             import gc
@@ -563,6 +684,10 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
             
 
             while env.has_idle_vehicle():
+                # 활성 요청이 없으면 액션을 선택하지 않고 시간 진행으로 넘김
+                if len(env.active_request_list) == 0:
+                    break
+
                 action_mask = env.get_action_mask()
                 action = agent.act(state, action_mask)
                 env.enrich_action(action)
@@ -707,16 +832,22 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                 req_info_list = []
                 total_num_accept = 0
                 total_num_serve = 0
+                total_occupancy = 0.0
                 for v in env.vehicle_list:
                     total_num_accept += v.num_accept
                     total_num_serve += v.num_serve
                     v.on_service_driving_time = env.curr_time - v.idle_time
+                    occ = 0.0
+                    if hasattr(v, "occupancy_sum") and hasattr(v, "occupancy_cnt") and v.occupancy_cnt > 0:
+                        occ = v.occupancy_sum / v.occupancy_cnt
+                    total_occupancy += occ
                     v_info = {
                         'id': v.id,
                         'num_accept': v.num_accept,
                         'num_serve': v.num_serve,
                         'idle_time': v.idle_time,
-                        'on_service_driving_time': v.on_service_driving_time
+                        'on_service_driving_time': v.on_service_driving_time,
+                        'occupancy': occ
                     }
                     drt_info_list.append(v_info)
 
@@ -755,6 +886,7 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                     mean_waiting_time = 0.0
                     mean_in_vehicle_time = 0.0
                     mean_detour_time = 0.0
+                mean_occupancy = total_occupancy / len(env.vehicle_list) if len(env.vehicle_list) > 0 else 0.0
 
                 print('====== Ep: {} / Reward: {} / Loss: {} / LR: {:.6f} ======'.format(
                     ep, total_reward, total_loss, agent.current_learning_rate))
@@ -767,6 +899,7 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                     'mean_waiting_time': mean_waiting_time,
                     'mean_in_vehicle_time': mean_in_vehicle_time,
                     'mean_detour_time': mean_detour_time,
+                    'mean_occupancy': mean_occupancy,
                     'event_sequence': env.event_sequences if hasattr(env, 'event_sequences') else [],
                     'drt_info': drt_info_list,
                     'request_info': req_info_list

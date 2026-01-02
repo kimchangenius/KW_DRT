@@ -13,9 +13,15 @@ class PPOAgent:
         self.hidden_dim = hidden_dim
         self.batch_size = batch_size
 
-        # Learning rates 분리
+        # Learning rates 분리 + Linear decay 설정
         self.actor_learning_rate = actor_learning_rate
         self.critic_learning_rate = critic_learning_rate
+        self.actor_initial_lr = actor_learning_rate
+        self.critic_initial_lr = critic_learning_rate
+        # 선형 스케줄 최종 학습률
+        self.lr_final = 1e-4
+        self.lr_decay_steps = 30000  # 학습 진행 시 선형으로 감소
+        self.train_step_count = 0
 
         # PPO hyperparameters
         self.clip_ratio = 0.13
@@ -299,6 +305,13 @@ class PPOAgent:
         self.current_learning_rate = max(min_lr, min(max_lr, self.current_learning_rate))
         # Actor lr는 고정(3e-6) 유지
         self.critic_optimizer.learning_rate.assign(self.current_learning_rate)
+
+    def _linear_lr(self, step, initial_lr):
+        """선형 스케줄: initial -> lr_final까지 lr_decay_steps 동안 감소"""
+        if self.lr_decay_steps <= 0:
+            return initial_lr
+        progress = min(1.0, step / float(self.lr_decay_steps))
+        return initial_lr + (self.lr_final - initial_lr) * progress
 
     def reset_learning_rate(self):
         self.current_learning_rate = self.initial_learning_rate
@@ -612,5 +625,13 @@ class PPOAgent:
             "skipped_actor": skipped_actor,
             "skipped_critic": skipped_critic,
         }
+
+        # 선형 스케줄로 actor/critic lr 감소
+        self.train_step_count += 1
+        new_actor_lr = self._linear_lr(self.train_step_count, self.actor_initial_lr)
+        new_critic_lr = self._linear_lr(self.train_step_count, self.critic_initial_lr)
+        self.actor_optimizer.learning_rate.assign(new_actor_lr)
+        self.current_learning_rate = new_critic_lr
+        self.critic_optimizer.learning_rate.assign(new_critic_lr)
 
         return (avg_actor_loss, avg_critic_loss)

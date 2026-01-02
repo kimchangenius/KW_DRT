@@ -95,11 +95,13 @@ class PrioritizedReplayBuffer:
         """우선순위 기반 샘플링"""
         if self.tree.n_entries < batch_size:
             return None
-
+        total = self.tree.total()
+        if total <= 0:
+            return None
         batch = []
         idxs = []
         priorities = []
-        segment = self.tree.total() / batch_size
+        segment = total / batch_size
 
         # NOTE: beta 증가는 외부에서 에피소드 기준으로 설정합니다.
 
@@ -114,7 +116,7 @@ class PrioritizedReplayBuffer:
             priorities.append(priority)
 
         # Importance Sampling Weights 계산
-        sampling_probabilities = np.array(priorities) / self.tree.total()
+        sampling_probabilities = np.array(priorities) / total
         is_weights = np.power(self.tree.n_entries * sampling_probabilities, -self.beta)
         is_weights /= is_weights.max()  # 정규화
 
@@ -133,6 +135,8 @@ class PrioritizedReplayBuffer:
         for idx, td_error in zip(idxs, td_errors):
             # TD-error의 절대값을 우선순위로 사용
             priority = (abs(td_error) + self.epsilon) ** self.alpha
+            # overflow/underflow 방지
+            priority = np.clip(priority, 1e-8, 1e6)
             self.tree.update(idx, priority)
             self.max_priority = max(self.max_priority, priority)
 

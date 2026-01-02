@@ -143,6 +143,15 @@ class RideSharingEnvironment:
                         v.num_passengers += r.num_passengers
                         assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
+                        # [추가] 합승 보너스 로직
+                        if v.num_passengers > 1:
+                            p_action_id = "{}_1".format(r.id)
+                            shared_bonus = 2.0 + (v.num_passengers / cfg.VEH_CAPACITY)
+                            d_reward_list.append([p_action_id, shared_bonus])
+                        else:
+                            p_action_id = "{}_1".format(r.id)
+                            d_reward_list.append([p_action_id, 0.5])
+                        
                         # R 업데이트
                         r.status = RequestStatus.PICKEDUP
                         r.waiting_time = self.curr_time - r.request_time    # 마지막 확정 업데이트
@@ -187,9 +196,10 @@ class RideSharingEnvironment:
                     self.done_request_list.append(r)
 
                     # Request 완료 보상 (Pickup and Dropoff, 지연 보상)
-                    p_action_id = "{}_1".format(r.id)
+                    # Dropoff 시에 Pickup 보상을 주는게 이상해서 line 195, 197 주석처리
+                    # p_action_id = "{}_1".format(r.id)
                     d_action_id = "{}_2".format(r.id)
-                    d_reward_list.append([p_action_id, 0.5])
+                    # d_reward_list.append([p_action_id, 0.5])
                     d_reward_list.append([d_action_id, 0.5])
 
                     # Logging
@@ -209,17 +219,14 @@ class RideSharingEnvironment:
                     r.status = RequestStatus.CANCELLED
                     cancelled_list.append(r)
 
-                # ACCEPTED 후 픽업까지의 강력 타임아웃
-                # 차량에 assign되었지만 실제 PICKEDUP으로 전환되지 못하는 요청을 강제로 취소
-                if r.status == RequestStatus.ACCEPTED:
-                    # assign 이후 경과 시간 계산
-                    if getattr(r, 'accepted_at', None) is None:
-                        # 최초 ACCEPT 기록이 없으면 지금 시각으로 초기화
-                        r.accepted_at = self.curr_time
-                    accepted_elapsed = self.curr_time - r.accepted_at
-                    if accepted_elapsed >= cfg.MAX_ACCEPT_WAIT:
-                        r.status = RequestStatus.CANCELLED
-                        cancelled_list.append(r)
+                # ACCEPTED 후 픽업까지의 강력 타임아웃 (현재 비활성화)
+                # if r.status == RequestStatus.ACCEPTED:
+                #     if getattr(r, 'accepted_at', None) is None:
+                #         r.accepted_at = self.curr_time
+                #     accepted_elapsed = self.curr_time - r.accepted_at
+                #     if accepted_elapsed >= cfg.MAX_ACCEPT_WAIT:
+                #         r.status = RequestStatus.CANCELLED
+                #         cancelled_list.append(r)
             if r.status == RequestStatus.PICKEDUP:
                 r.in_vehicle_time = self.curr_time - r.pickup_at
 
@@ -230,7 +237,6 @@ class RideSharingEnvironment:
         # 취소된 요청이 차량 active 리스트에 남아있다면 안전하게 제거하고 지연보상 부여
         if len(cancelled_list) > 0:
             for v in self.vehicle_list:
-                to_remove = []
                 for r in v.active_request_list:
                     if v.target_request in cancelled_list:
                         v.status = VehicleStatus.IDLE
@@ -248,6 +254,11 @@ class RideSharingEnvironment:
 
         for idx, r in enumerate(self.active_request_list):
             r.slot_idx = idx
+
+        # Occupancy 누적(한 타임스텝마다 현재 탑승 인원 기록)
+        for v in self.vehicle_list:
+            v.occupancy_sum = getattr(v, "occupancy_sum", 0.0) + v.num_passengers
+            v.occupancy_cnt = getattr(v, "occupancy_cnt", 0) + 1
 
         return d_reward_list, [r.id for r in cancelled_list]
 
@@ -425,6 +436,61 @@ class RideSharingEnvironment:
             assert len(v_row) == cfg.POSSIBLE_ACTION, "Action mask length mismatch"
             all_list.append(v_row)
         return np.array(all_list, dtype=np.float32)
+
+    # ---------------- LLM 연동을 위한 보조 함수들 ----------------
+    def get_request_slot_by_id(self, request_id):
+        """
+        현재 활성 요청 리스트에서 주어진 request_id가 차지하는 슬롯 인덱스를 반환.
+        없으면 None.
+        """
+        for idx, r in enumerate(self.active_request_list):
+            if r.id == request_id:
+                return idx
+        return None
+
+    def build_llm_state_snapshot(self):
+        """
+        LLM 프롬프트용 간단한 상태 요약을 문자열 리스트로 반환한다.
+        vehicles: ["V0: loc=12, load=1/4, status=IDLE, next=0 ETA=-1", ...]
+        requests: ["R104: 10->25, req_t=110, wait=15, due=40, pax=1, status=PENDING", ...]
+        """
+        vehicles_desc = []
+        for v in self.vehicle_list:
+            vehicles_desc.append(
+                f"V{v.id}: loc={v.curr_node}, load={v.num_passengers}/{cfg.VEH_CAPACITY}, "
+                f"status={v.status.name}, next={v.next_node}, ETA={v.target_arrival_time}"
+            )
+
+        requests_desc = []
+        for r in self.active_request_list:
+            requests_desc.append(
+                f"R{r.id}: {r.from_node_id}->{r.to_node_id}, req_t={r.request_time}, "
+                f"wait={r.waiting_time}, due={getattr(r, 'arrival_due_left', 0)}, "
+                f"pax={r.num_passengers}, status={r.status.name}"
+            )
+
+        return vehicles_desc, requests_desc
+
+    def build_llm_action_space(self):
+        """
+        LLM에 전달할 액션 공간 설명을 문자열로 반환.
+        """
+        assign_max = cfg.MAX_NUM_REQUEST
+        return (
+            f"0~{assign_max-1}: ASSIGN request_slot to vehicle (slot=index in active list), "
+            f"{cfg.POSSIBLE_ACTION-1}: REJECT/WAIT"
+        )
+
+    def format_action_mask(self, action_mask):
+        """
+        액션 마스크(np.array)를 사람이 읽을 수 있는 문자열로 변환.
+        예: {(V0,slot0):1, (V0,slot1):0, ...}
+        """
+        entries = []
+        for v_idx, row in enumerate(action_mask):
+            for a_idx, val in enumerate(row):
+                entries.append(f"(V{v_idx},A{a_idx})={int(val)}")
+        return "{" + ", ".join(entries) + "}"
 
     def enrich_action(self, action):
         vehicle_idx = action[0]

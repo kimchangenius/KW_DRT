@@ -1,3 +1,4 @@
 {
-    "python.defaultInterpreterPath": "C:\\Users\\khlk0\\anaconda3\\envs\\KW_DRT\\python.exe"
+    "python.defaultInterpreterPath": "C:\\Users\\khlk0\\anaconda3\\envs\\KW_DRT\\python.exe",
+    "git.ignoreLimitWarning": true
 } 

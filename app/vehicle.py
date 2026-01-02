@@ -21,6 +21,9 @@ class Vehicle:
         self.num_serve = 0
         self.idle_time = 0
         self.on_service_driving_time = 0
+        # Occupancy 추적용 누적치
+        self.occupancy_sum = 0.0
+        self.occupancy_cnt = 0
 
     def __str__(self):
         return (f"[V](id={self.id} / "
