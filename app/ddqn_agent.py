@@ -286,10 +286,96 @@ class DDQNAgent:
         if transition is not None:
             self.remember(transition)
 
+    @tf.function(reduce_retracing=True)
+    def _optimize_on_batch(
+        self,
+        s_v,
+        s_r,
+        s_rel,
+        ns_v,
+        ns_r,
+        ns_rel,
+        action_masks,
+        actions,
+        rewards,
+        dones,
+    ):
+        """
+        고정된 입력 signature로 학습 스텝을 컴파일해 tf.function retracing 경고를 완화.
+        """
+        # 입력 shape 고정
+        s_v = tf.ensure_shape(s_v, (self.batch_size, cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM))
+        s_r = tf.ensure_shape(s_r, (self.batch_size, cfg.MAX_NUM_REQUEST, cfg.REQUEST_INPUT_DIM))
+        s_rel = tf.ensure_shape(s_rel, (self.batch_size, cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM))
+        ns_v = tf.ensure_shape(ns_v, (self.batch_size, cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM))
+        ns_r = tf.ensure_shape(ns_r, (self.batch_size, cfg.MAX_NUM_REQUEST, cfg.REQUEST_INPUT_DIM))
+        ns_rel = tf.ensure_shape(ns_rel, (self.batch_size, cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM))
+
+        action_masks = tf.ensure_shape(
+            tf.cast(action_masks, tf.float32),
+            (self.batch_size, cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST + 1),
+        )
+        actions = tf.ensure_shape(tf.cast(actions, tf.int32), (self.batch_size, 2))
+        rewards = tf.ensure_shape(tf.cast(rewards, tf.float32), (self.batch_size,))
+        dones = tf.ensure_shape(tf.cast(dones, tf.float32), (self.batch_size,))
+
+        states = [s_v, s_r, s_rel]
+        next_states = [ns_v, ns_r, ns_rel]
+
+        # Target 계산
+        next_q_main = self.model(next_states, training=False)
+        inf_mask = (1.0 - action_masks) * -1e9
+        masked_next_q = next_q_main + inf_mask
+
+        bsz = tf.shape(next_q_main)[0]
+        flat_next_q = tf.reshape(masked_next_q, [bsz, -1])
+        max_action_indices = tf.argmax(flat_next_q, axis=1, output_type=tf.int32)
+
+        next_q_target = self.target_model(next_states, training=False)
+        flat_target_q = tf.reshape(next_q_target, [bsz, -1])
+
+        batch_indices = tf.range(bsz, dtype=tf.int32)
+        gather_indices = tf.stack([batch_indices, max_action_indices], axis=1)
+        max_next_q_val = tf.gather_nd(flat_target_q, gather_indices)
+
+        target_q = rewards + (1.0 - dones) * self.gamma * max_next_q_val
+        target_q = tf.stop_gradient(target_q)
+
+        # Gradient Descent
+        with tf.GradientTape() as tape:
+            q_values = self.model(states, training=True)
+
+            v_indices = actions[:, 0]
+            a_indices = actions[:, 1]
+
+            shape_q = tf.shape(q_values)
+            num_acts = shape_q[2]
+
+            flat_act_indices = v_indices * num_acts + a_indices
+            flat_q_values = tf.reshape(q_values, [bsz, -1])
+            gather_indices_main = tf.stack([batch_indices, flat_act_indices], axis=1)
+
+            main_q_val = tf.gather_nd(flat_q_values, gather_indices_main)
+
+            huber_loss = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.NONE)(target_q, main_q_val)
+            loss = tf.reduce_mean(huber_loss)
+
+            if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+                scaled_loss = self.optimizer.get_scaled_loss(loss)
+            else:
+                scaled_loss = loss
+
+        if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+            grads = tape.gradient(scaled_loss, self.model.trainable_variables)
+            grads = self.optimizer.get_unscaled_gradients(grads)
+        else:
+            grads = tape.gradient(loss, self.model.trainable_variables)
+
+        grads = [tf.clip_by_norm(g, 1.0) for g in grads]
+        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        return loss
+
     def train(self):
-        """
-        PER 없이 균등 샘플링 리플레이 버퍼 기반 학습.
-        """
         if len(self.replay_buffer) < self.batch_size:
             return None
 
@@ -335,57 +421,18 @@ class DDQNAgent:
             rewards = np.array([b[2] for b in batch], dtype=np.float32)
             dones = np.array([b[4] for b in batch], dtype=np.float32)
 
-            # Target 계산
-            next_q_main = self.model(next_states, training=False)
-            inf_mask = (1.0 - action_masks) * -1e9
-            masked_next_q = next_q_main + inf_mask
-
-            bsz = tf.shape(next_q_main)[0]
-            flat_next_q = tf.reshape(masked_next_q, [bsz, -1])
-            max_action_indices = tf.argmax(flat_next_q, axis=1, output_type=tf.int32)
-
-            next_q_target = self.target_model(next_states, training=False)
-            flat_target_q = tf.reshape(next_q_target, [bsz, -1])
-
-            batch_indices = tf.range(bsz, dtype=tf.int32)
-            gather_indices = tf.stack([batch_indices, max_action_indices], axis=1)
-            max_next_q_val = tf.gather_nd(flat_target_q, gather_indices)
-
-            target_q = rewards + (1.0 - dones) * self.gamma * max_next_q_val
-            target_q = tf.stop_gradient(target_q)
-
-            # Gradient Descent
-            with tf.GradientTape() as tape:
-                q_values = self.model(states, training=True)
-
-                v_indices = actions[:, 0]
-                a_indices = actions[:, 1]
-
-                shape_q = tf.shape(q_values)
-                num_acts = shape_q[2]
-
-                flat_act_indices = v_indices * num_acts + a_indices
-                flat_q_values = tf.reshape(q_values, [bsz, -1])
-                gather_indices_main = tf.stack([batch_indices, flat_act_indices], axis=1)
-
-                main_q_val = tf.gather_nd(flat_q_values, gather_indices_main)
-
-                huber_loss = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.NONE)(target_q, main_q_val)
-                loss = tf.reduce_mean(huber_loss)
-
-                if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
-                    scaled_loss = self.optimizer.get_scaled_loss(loss)
-                else:
-                    scaled_loss = loss
-
-            if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
-                grads = tape.gradient(scaled_loss, self.model.trainable_variables)
-                grads = self.optimizer.get_unscaled_gradients(grads)
-            else:
-                grads = tape.gradient(loss, self.model.trainable_variables)
-
-            grads = [tf.clip_by_norm(g, 1.0) for g in grads]
-            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            loss = self._optimize_on_batch(
+                tf.convert_to_tensor(s_v, dtype=tf.float32),
+                tf.convert_to_tensor(s_r, dtype=tf.float32),
+                tf.convert_to_tensor(s_rel, dtype=tf.float32),
+                tf.convert_to_tensor(ns_v, dtype=tf.float32),
+                tf.convert_to_tensor(ns_r, dtype=tf.float32),
+                tf.convert_to_tensor(ns_rel, dtype=tf.float32),
+                tf.convert_to_tensor(action_masks, dtype=tf.float32),
+                tf.convert_to_tensor(actions, dtype=tf.int32),
+                tf.convert_to_tensor(rewards, dtype=tf.float32),
+                tf.convert_to_tensor(dones, dtype=tf.float32),
+            )
 
             # 후처리
             if self.epsilon > self.epsilon_min:

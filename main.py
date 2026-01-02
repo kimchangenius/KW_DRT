@@ -1,17 +1,6 @@
 import os
 import sys
 
-# CUDA DLL 경로 추가 (TensorFlow import 전에 필수!)
-conda_env_path = r'C:\Users\khlk0\anaconda3\envs\KW_DRT'
-cuda_bin_path = os.path.join(conda_env_path, 'Library', 'bin')
-if os.path.exists(cuda_bin_path):
-    os.add_dll_directory(cuda_bin_path)
-    # PATH 환경변수에도 추가
-    os.environ['PATH'] = cuda_bin_path + os.pathsep + os.environ.get('PATH', '')
-    print(f"CUDA DLL 경로 추가: {cuda_bin_path}")
-else:
-    print(f"경고: CUDA 경로를 찾을 수 없습니다: {cuda_bin_path}")
-
 # GPU 설정
 import tensorflow as tf
 import csv
@@ -29,56 +18,11 @@ from app.vehicle_status import VehicleStatus
 import time
 import numpy as np
 
-# XLA JIT 컴파일 완전 비활성화
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=0'
-os.environ['TF_XLA_ENABLE_XLA_DEVICES'] = '0'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # libdevice 경고 숨기기
-tf.config.optimizer.set_jit(False)
-
-print("GPU Available:", tf.config.list_physical_devices('GPU'))
-print("TensorFlow version:", tf.__version__)
-
-# 혼합 정밀도: GPU 사용 시 메모리 절감
-try:
-    if len(tf.config.list_physical_devices('GPU')) > 0:
-        from tensorflow.keras import mixed_precision
-        mixed_precision.set_global_policy('mixed_float16')
-        print("[OK] Mixed precision 활성화 (mixed_float16)")
-except Exception as e:
-    print(f"[Info] Mixed precision 설정 스킵: {e}")
-
-# GPU 메모리 설정 (OOM 방지)
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        # GPU 메모리 제한 설정 (3GB) - PER로 효율적 관리
-        for gpu in gpus:
-            tf.config.set_logical_device_configuration(
-                gpu,
-                [tf.config.LogicalDeviceConfiguration(memory_limit=3072)]
-            )
-        print(f"[OK] GPU {len(gpus)}개 사용 가능 - 메모리 제한: 3GB")
-        print(f"[OK] XLA JIT 컴파일 비활성화 완료")
-    except RuntimeError as e:
-        # 이미 초기화된 경우 메모리 증가 모드로 폴백
-        print(f"GPU 메모리 제한 설정 실패 (이미 초기화됨): {e}")
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"[OK] GPU {len(gpus)}개 사용 - 메모리 증가 모드 활성화")
-        except Exception as e2:
-            print(f"GPU 설정 오류: {e2}")
-else:
-    print("WARNING: GPU를 찾을 수 없습니다. CPU로 실행됩니다.")
 
 CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
 RESULT_PATH = os.path.join(CURR_PATH, 'result')
 
-# LLM 설정 (config 기반)
-USE_LLM_ASSIST = cfg.LLM_ENABLED
-LLM_CONSTRAINTS = "용량<=max, 시간창 준수, detour/대기 최소화"
-LLM_STEP_INTERVAL = cfg.LLM_STEP_INTERVAL  # N 스텝마다 LLM 사용
 
 def log_episode(path, info):
     ep = info['episode']
