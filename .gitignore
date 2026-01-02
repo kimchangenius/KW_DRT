@@ -1,0 +1,9 @@
+.idea/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+.DS_Store
+result/*
+!result/.gitkeep
