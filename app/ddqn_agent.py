@@ -24,7 +24,7 @@ class DDQNAgent:
         self.target_model.set_weights(self.model.get_weights())
 
         self.train_step = 0
-        self.update_target_freq = 200  # 더 자주 타겟 네트워크 업데이트
+        self.update_target_freq = 500
         # Mixed precision에서 손실 스케일링 적용
         base_opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
         try:
@@ -32,10 +32,10 @@ class DDQNAgent:
         except Exception:
             self.optimizer = base_opt
 
-        self.gamma = 0.99
+        self.gamma = 0.97
         self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.99  # 더 천천히 감소
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.99
 
         # Prioritized Experience Replay 사용
         # self.replay_buffer = PrioritizedReplayBuffer(
@@ -44,7 +44,7 @@ class DDQNAgent:
         #     beta=0.4,   # IS weights 보정 강도 (초기값)
         #     beta_increment=0.00015  # 5000 ep 기준: 4000 ep에서 1.0 도달
         # )
-        self.replay_buffer = ReplayBuffer(capacity=800)
+        self.replay_buffer = ReplayBuffer(capacity=2000)
         self.pending_buffer = PendingBuffer()
         
         # 학습률 스케줄링
@@ -105,10 +105,7 @@ class DDQNAgent:
         # Concatenate along request dim → total 21 actions
         q_total = Concatenate(axis=-1)([q_match, q_reject])  # (B, V, R+1)
 
-        # Output scaling to bound Q-values and prevent explosion
-        q_scaled = Lambda(lambda x: 5.0 * tf.tanh(x))(q_total)  # (-5, 5)
-
-        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_scaled)
+        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_total)
 
     def get_action_q_values(self, state, action_mask):
         # 1. 입력 차원 확인 (Vehicle State 기준)
@@ -165,11 +162,19 @@ class DDQNAgent:
     
 
     def act(self, state, action_mask):
+        # REJECT가 아닌 유효 액션이 있으면 REJECT를 마스크에서 제거하고 선택
+        mask_no_reject = np.array(action_mask, copy=True)
+        if mask_no_reject.shape[-1] > 0:
+            mask_no_reject[..., -1] = 0
+        has_non_reject = np.any(mask_no_reject)
+        effective_mask = mask_no_reject if has_non_reject else action_mask
+
         # 1. 탐험 (Exploration)
         if np.random.rand() <= self.epsilon:
             # 마스크가 1인(가능한) 행동 중에서 무작위 선택
             # action_mask shape: (Vehicle, Action) -> Flatten
-            flat_mask = action_mask.flatten()
+            # flat_mask = action_mask.flatten()
+            flat_mask = effective_mask.flatten()
             available_indices = np.where(flat_mask == 1)[0]
             
             if len(available_indices) == 0:
@@ -181,7 +186,8 @@ class DDQNAgent:
         # 2. 활용 (Exploitation)
         else:
             # Q-Value 계산 (위에서 수정한 함수 사용)
-            q_values = self.get_action_q_values(state, action_mask)
+            # q_values = self.get_action_q_values(state, action_mask)
+            q_values = self.get_action_q_values(state, effective_mask)
             
             # (Vehicle, Action) -> (V*A) Flatten
             flat_q_values = tf.reshape(q_values, [-1])
@@ -237,11 +243,9 @@ class DDQNAgent:
             older_avg = sum(self.recent_rewards[-10:-5]) / 5 if len(self.recent_rewards) >= 10 else recent_avg
             
             if recent_avg > older_avg:
-                # 성능이 향상되면 더 천천히 감소 (더 많은 탐험)
-                self.epsilon_decay = 0.9998
+                self.epsilon_decay = 0.993
             else:
-                # 성능이 하락하면 더 빠르게 감소 (더 많은 활용)
-                self.epsilon_decay = 0.9990
+                self.epsilon_decay = 0.985
         
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -433,10 +437,6 @@ class DDQNAgent:
                 tf.convert_to_tensor(rewards, dtype=tf.float32),
                 tf.convert_to_tensor(dones, dtype=tf.float32),
             )
-
-            # 후처리
-            if self.epsilon > self.epsilon_min:
-                self.epsilon *= self.epsilon_decay
 
             self.train_step_cnt += 1
             if self.train_step_cnt % self.update_target_freq == 0:

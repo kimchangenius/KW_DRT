@@ -142,6 +142,13 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                 os.remove(dqn_log_path)
             except PermissionError:
                 print(f"[Warn] 기존 DQN 로그 파일을 삭제하지 못했습니다: {dqn_log_path}")
+        # 에피소드별 보상 로그 초기화 파일 경로
+        rewards_log_path = os.path.join(run_path, "episodes_reward.csv")
+        if os.path.exists(rewards_log_path):
+            try:
+                os.remove(rewards_log_path)
+            except PermissionError:
+                print(f"[Warn] 기존 보상 로그 파일을 삭제하지 못했습니다: {rewards_log_path}")
 
     env = env_builder.build()
     agent = DDQNAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
@@ -157,6 +164,7 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
     e_info_list = []
     best_reward = float('-inf')
     total_time = 0.0
+    reward_log_list = []
     # 에피소드별 추가 로깅용 변수
     gamma = 0.99
 
@@ -170,6 +178,8 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
         step_in_ep = 0
         state = env.reset()
         state = sanitize_state(state)
+
+        agent.pending_buffer.clear()
 
         # DDQN 학습률 업데이트
         # agent.update_learning_rate(ep)
@@ -193,6 +203,10 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                 # print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
 
                 action_mask = env.get_action_mask()
+                # 유효 액션이 전혀 없으면 무한 REJECT를 방지하기 위해 루프 탈출
+                if np.all(action_mask == 0):
+                    print(f"[Debug] Step {env.curr_step}: 액션 마스크 전부 0")
+                    break
                 # LLM은 탐험 구간에서만, 설정한 스텝 간격에 따라 사용
                 # use_llm_now = (
                 #     USE_LLM_ASSIST
@@ -278,9 +292,17 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
 
             for pair in d_reward_list:
                 action_id, reward = pair
-                print(f"[Debug] Step {env.curr_step}: 시간 업데이트로 인한 지연 보상 - {action_id} (보상: {reward})")
                 agent.confirm_and_remember(action_id, reward)
                 delayed_reward_confirm += 1
+                if action_id == "STEP_BONUS":
+                    continue
+                else:
+                    print(f"[Debug] Step {env.curr_step}: 시간 업데이트로 인한 지연 보상 - {action_id} (보상: {reward})")
+
+            # 시간 경과로 발생한 보상을 total_reward에 합산
+            if len(d_reward_list) > 0:
+                time_reward = sum(reward for _, reward in d_reward_list)
+                total_reward += time_reward
 
             # 취소된 request 관련 pending action 즉시 제거 (PICKUP, DROPOFF 모두)
             for rid in cancelled_request_ids:
@@ -316,15 +338,15 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                             v.next_node = 0
                         v.active_request_list = [r for r in v.active_request_list if str(r.id) != req_id]
 
-            # 모든 요청이 소진되었는데 pending이 남았다면 강제로 정리해 에피소드 종료 유도
-            if len(env.active_request_list) == 0 and len(env.future_request_list) == 0 and len(agent.pending_buffer) > 0:
-                print("[세이프가드] 남은 요청 없음 + Pending 잔여 -> Pending 강제 정리")
-                agent.pending_buffer.clear()
-                for v in env.vehicle_list:
-                    v.status = VehicleStatus.IDLE
-                    v.target_request = None
-                    v.target_arrival_time = -1
-                    v.next_node = 0
+            # # 모든 요청이 소진되었는데 pending이 남았다면 강제로 정리해 에피소드 종료 유도
+            # if len(env.active_request_list) == 0 and len(env.future_request_list) == 0 and len(agent.pending_buffer) > 0:
+            #     print("[세이프가드] 남은 요청 없음 + Pending 잔여 -> Pending 강제 정리")
+            #     agent.pending_buffer.clear()
+            #     for v in env.vehicle_list:
+            #         v.status = VehicleStatus.IDLE
+            #         v.target_request = None
+            #         v.target_arrival_time = -1
+            #         v.next_node = 0
 
             if env.is_done():
                 # 마지막 transition의 done을 True로 변경
@@ -454,6 +476,17 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
                 }
                 if write_result is True:
                     log_episode(run_path, e_info_full)
+                # 에피소드별 보상 기록 누적
+                rr = env.reward_record
+                reward_log_list.append({
+                    "episode": ep,
+                    "decision": rr.DecisionReward,
+                    "immediate": rr.ImmediateReward,
+                    "delayed": rr.DelayedReward,
+                    "cancel_penalty": rr.CancelPenalty,
+                    "maintenance": rr.MaintenanceReward,
+                    "total": rr.total(),
+                })
 
                 # 메모리 절약: 요약만 리스트에 저장
                 e_info_summary = {
@@ -503,28 +536,27 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
         total_time += progress_time
         print(f"실행 시간: {progress_time:.6f}초")
 
-        # 세션/캐시 정리 (주기적 OOM 완화)
-        if ep % 20 == 0:
-            try:
-                tf.keras.backend.clear_session()
-                import gc
-                gc.collect()
-                print("[메모리 정리] Keras 세션 정리 및 GC 수행")
-            except Exception as e:
-                print(f"[Info] 세션 정리 스킵: {e}")
 
-        # 적응형 Epsilon 감소 (성능 기반)
-        #agent.adaptive_epsilon_decay(total_reward)
         agent.decay_epsilon()
 
-        # GPU 메모리 정리 (10 에피소드마다 - OOM 방지 강화)
-        if ep % 10 == 0:
-            import gc
-            gc.collect()
-            # Replay Buffer 크기 제한 강제
-            if len(agent.replay_buffer) > agent.replay_buffer.capacity:
-                print(f"[경고] Replay Buffer 초과: {len(agent.replay_buffer)} > {agent.replay_buffer.capacity}")
-            print(f"[메모리 정리] Episode {ep} 완료 (Buffer: {len(agent.replay_buffer)}/{agent.replay_buffer.capacity})")
+        # # 세션/캐시 정리 (주기적 OOM 완화)
+        # if ep % 20 == 0:
+        #     try:
+        #         tf.keras.backend.clear_session()
+        #         import gc
+        #         gc.collect()
+        #         print("[메모리 정리] Keras 세션 정리 및 GC 수행")
+        #     except Exception as e:
+        #         print(f"[Info] 세션 정리 스킵: {e}")
+
+        # # GPU 메모리 정리 (10 에피소드마다 - OOM 방지 강화)
+        # if ep % 10 == 0:
+        #     import gc
+        #     gc.collect()
+        #     # Replay Buffer 크기 제한 강제
+        #     if len(agent.replay_buffer) > agent.replay_buffer.capacity:
+        #         print(f"[경고] Replay Buffer 초과: {len(agent.replay_buffer)} > {agent.replay_buffer.capacity}")
+        #     print(f"[메모리 정리] Episode {ep} 완료 (Buffer: {len(agent.replay_buffer)}/{agent.replay_buffer.capacity})")
 
     # 총 실행 시간
     if total_time < 60:
@@ -541,6 +573,29 @@ def train_ddqn(env_builder, config, write_result=False, load_model=False):
 
     if write_result is True:
         log_all_episodes(run_path, e_info_list, total_time)
+        # 에피소드별 보상 CSV 저장
+        rewards_log_path = os.path.join(run_path, "episodes_reward.csv")
+        with open(rewards_log_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Episode",
+                "DecisionReward",
+                "ImmediateReward",
+                "DelayedReward",
+                "CancelPenalty",
+                "MaintenanceReward",
+                "TotalReward"
+            ])
+            for rec in reward_log_list:
+                writer.writerow([
+                    rec["episode"],
+                    f"{rec['decision']:.4f}",
+                    f"{rec['immediate']:.4f}",
+                    f"{rec['delayed']:.4f}",
+                    f"{rec['cancel_penalty']:.4f}",
+                    f"{rec['maintenance']:.4f}",
+                    f"{rec['total']:.4f}",
+                ])
 
 def sanitize_state(state):
     """
@@ -633,6 +688,9 @@ def train_ppo(env_builder, config, write_result=False, load_model=False):
                     break
 
                 action_mask = env.get_action_mask()
+                if np.all(action_mask == 0):
+                    print(f"[Debug] Step {env.curr_step}: 액션 마스크 전부 0")
+                    break
                 action = agent.act(state, action_mask)
                 env.enrich_action(action)
 
@@ -1242,7 +1300,6 @@ def train_mappo(env_builder, config, write_result=False, load_model=False):
 
 def main():
     env_builder = EnvBuilder(data_dir=DATA_PATH, result_dir=RESULT_PATH)
-
 
     for params in cfg.config_list:
         train_ddqn(env_builder, params, write_result=True, load_model=False)

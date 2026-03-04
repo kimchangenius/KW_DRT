@@ -7,7 +7,7 @@ from app.request_status import RequestStatus
 from app.vehicle import Vehicle
 from app.vehicle_status import VehicleStatus
 from app.action_type import ActionType
-
+from app.reward_record import RewardRecord
 
 class RideSharingEnvironment:
     def __init__(self, network, original_request_list, vehicle_init_pos):
@@ -31,6 +31,7 @@ class RideSharingEnvironment:
 
         # Logging
         self.logs = []
+        self.reward_record = RewardRecord()
 
     def reset(self, random_vehicle_positions=False):
         self.curr_time = 0
@@ -41,6 +42,8 @@ class RideSharingEnvironment:
         self.done_request_list = []
 
         self.vehicle_list = []
+        # 에피소드 단위 보상 기록 초기화
+        self.reward_record = RewardRecord()
         
         # 이벤트 시퀀스 초기화
         self.event_sequences = [[] for _ in range(cfg.MAX_NUM_VEHICLES)]
@@ -131,33 +134,26 @@ class RideSharingEnvironment:
                     v.target_arrival_time = -1
 
                     if r.status == RequestStatus.CANCELLED:
-                        # Pickup 실패 - 안전한 제거
                         if r in v.active_request_list:
                             v.active_request_list.remove(r)
 
-                        # Cancel 페널티 (Pickup 결정, 지연 보상(페널티))
                         p_action_id = "{}_1".format(r.id)
-                        d_reward_list.append([p_action_id, -1])
+                        penalty = self.reward_record.add_cancel(-0.5)
+                        d_reward_list.append([p_action_id, penalty])
                     else:
-                        # Pickup 성공
                         v.num_passengers += r.num_passengers
                         assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
-                        # [추가] 합승 보너스 로직
-                        if v.num_passengers > 1:
-                            p_action_id = "{}_1".format(r.id)
-                            shared_bonus = 2.0 + (v.num_passengers / cfg.VEH_CAPACITY)
-                            d_reward_list.append([p_action_id, shared_bonus])
-                        else:
-                            p_action_id = "{}_1".format(r.id)
-                            d_reward_list.append([p_action_id, 0.5])
-                        
-                        # R 업데이트
                         r.status = RequestStatus.PICKEDUP
-                        r.waiting_time = self.curr_time - r.request_time    # 마지막 확정 업데이트
-                        r.pickup_at = self.curr_time                      # 마지막 확정 업데이트
-                        
-                        # 픽업 완료 이벤트 기록
+                        r.waiting_time = self.curr_time - r.request_time
+                        r.pickup_at = self.curr_time
+
+                        early_ratio = max(0, 1 - r.waiting_time / cfg.MAX_WAIT_TIME)
+                        pickup_success_reward = 0.5 + 0.2 * early_ratio
+                        p_action_id = "{}_1".format(r.id)
+                        delayed = self.reward_record.add_delayed(pickup_success_reward)
+                        d_reward_list.append([p_action_id, delayed])
+
                         if hasattr(self, 'event_sequences'):
                             seq = f"P_{r.id}"
                             self.event_sequences[v.id].append(seq)
@@ -166,6 +162,8 @@ class RideSharingEnvironment:
                 if v.target_arrival_time == self.curr_time:
                     # 이번 시간에 dropoff 도착했으면
                     r = v.target_request
+
+                    passengers_before = v.num_passengers
 
                     # V 업데이트
                     v.status = VehicleStatus.IDLE
@@ -195,16 +193,17 @@ class RideSharingEnvironment:
                         self.active_request_list.remove(r)
                     self.done_request_list.append(r)
 
-                    # Request 완료 보상 (Pickup and Dropoff, 지연 보상)
-                    # Dropoff 시에 Pickup 보상을 주는게 이상해서 line 195, 197 주석처리
-                    # p_action_id = "{}_1".format(r.id)
+                    delay = max(0, self.curr_time - r.arrival_due)
+                    on_time_bonus = 0.3 if delay == 0 else 0.0
+                    delay_penalty = 0.1 * delay
+                    final_reward = 2.0 + on_time_bonus - delay_penalty
+
                     d_action_id = "{}_2".format(r.id)
-                    # d_reward_list.append([p_action_id, 0.5])
-                    d_reward_list.append([d_action_id, 0.5])
+                    delayed_reward = self.reward_record.add_delayed(final_reward)
+                    d_reward_list.append([d_action_id, delayed_reward])
 
-                    # Logging
                     v.num_serve += 1
-
+            
         # Request 업데이트
         cancelled_list = []
         for r in self.active_request_list:
@@ -214,19 +213,24 @@ class RideSharingEnvironment:
             if r.status == RequestStatus.PENDING or r.status == RequestStatus.ACCEPTED:
                 r.waiting_time = self.curr_time - r.request_time
 
-                # waiting_time 초과 확인 (PENDING)
-                if r.status == RequestStatus.PENDING and r.waiting_time >= cfg.MAX_WAIT_TIME:
+                # waiting_time 초과 확인 (PENDING 또는 ACCEPTED)
+                if r.waiting_time >= cfg.MAX_WAIT_TIME:
                     r.status = RequestStatus.CANCELLED
                     cancelled_list.append(r)
+                # ACCEPTED인데 할당 차량이 픽업으로 이동하지 않는 경우 안전 취소
+                elif r.status == RequestStatus.ACCEPTED:
+                    assigned_vid = getattr(r, "assigned_v_id", None)
+                    if assigned_vid is not None and assigned_vid < len(self.vehicle_list):
+                        v_assigned = self.vehicle_list[assigned_vid]
+                        heading_to_pickup = (
+                            v_assigned.target_request is r
+                            and v_assigned.status == VehicleStatus.PICKUP
+                        )
+                        if not heading_to_pickup:
+                            r.status = RequestStatus.CANCELLED
+                            cancelled_list.append(r)
+                            print(f"[Debug] 픽업하러 이동하지 않음으로 인한 취소: {r.id}")
 
-                # ACCEPTED 후 픽업까지의 강력 타임아웃 (현재 비활성화)
-                # if r.status == RequestStatus.ACCEPTED:
-                #     if getattr(r, 'accepted_at', None) is None:
-                #         r.accepted_at = self.curr_time
-                #     accepted_elapsed = self.curr_time - r.accepted_at
-                #     if accepted_elapsed >= cfg.MAX_ACCEPT_WAIT:
-                #         r.status = RequestStatus.CANCELLED
-                #         cancelled_list.append(r)
             if r.status == RequestStatus.PICKEDUP:
                 r.in_vehicle_time = self.curr_time - r.pickup_at
 
@@ -248,9 +252,9 @@ class RideSharingEnvironment:
                     for r in request_to_remove:
                         v.active_request_list.remove(r)
 
-                        # 지연 보상
                         p_action_id = "{}_1".format(r.id)
-                        d_reward_list.append([p_action_id, -1])
+                        penalty = self.reward_record.add_cancel(-0.5)
+                        d_reward_list.append([p_action_id, penalty])
 
         for idx, r in enumerate(self.active_request_list):
             r.slot_idx = idx
@@ -491,6 +495,8 @@ class RideSharingEnvironment:
             for a_idx, val in enumerate(row):
                 entries.append(f"(V{v_idx},A{a_idx})={int(val)}")
         return "{" + ", ".join(entries) + "}"
+    
+    # -----------------------------------------------------------------------------------------
 
     def enrich_action(self, action):
         vehicle_idx = action[0]
@@ -530,10 +536,8 @@ class RideSharingEnvironment:
         v = self.vehicle_list[vehicle_idx]
 
         if action_idx == cfg.POSSIBLE_ACTION - 1:
-            # Reject
             v.status = VehicleStatus.REJECT
-
-            # Logging
+            reward += self.reward_record.add_decision(-0.05)
             v.idle_time += 1
         else:
             # Matching
@@ -560,9 +564,7 @@ class RideSharingEnvironment:
                 r.status = RequestStatus.ACCEPTED
                 r.assigned_v_id = v.id
 
-                # Pickup 결정 보상 (최대 1점, 즉시 보상)
-                reward = 0.5 * (1 - pickup_duration / self.network.max_duration)
-                + 0.5 * (1 - r.waiting_time / cfg.MAX_WAIT_TIME)
+                reward += self.reward_record.add_decision(0.1)
 
                 # Logging
                 v.num_accept += 1
@@ -580,8 +582,7 @@ class RideSharingEnvironment:
                     r.waiting_time = self.curr_time - r.request_time  # 마지막 확정 업데이트
                     r.pickup_at = self.curr_time  # 마지막 확정 업데이트
 
-                    # Pickup 결정 즉시 완료 보상
-                    reward += 1
+                    reward += self.reward_record.add_immediate(0.3)
                     info['is_pending'] = False
 
             else:
@@ -593,13 +594,8 @@ class RideSharingEnvironment:
                 dropoff_duration = self.network.get_duration(v.curr_node, v.next_node)
                 v.target_arrival_time = self.curr_time + dropoff_duration
 
-                # Dropoff 결정 리워드 (즉시 보상)
-                in_vehicle_ratio = r.in_vehicle_time / cfg.MAX_INVEHICLE_TIME
-                if in_vehicle_ratio > 1:
-                    in_vehicle_ratio = 1
-                reward = 0.5 * (1 - dropoff_duration / self.network.max_duration)
-                + 0.5 * (1 - in_vehicle_ratio)
-
+                reward += self.reward_record.add_decision(0.1)
+                
                 # 만약 Dropoff가 즉시 완료된다면
                 if v.curr_node == v.next_node:
                     v.status = VehicleStatus.IDLE
@@ -617,20 +613,17 @@ class RideSharingEnvironment:
                     self.active_request_list.remove(r)
                     self.done_request_list.append(r)
 
-                    # Dropoff 결정 즉시 완료 보상
-                    reward += 1
+                    delay = max(0, self.curr_time - r.arrival_due)
+                    on_time_bonus = 0.3 if delay == 0 else 0.0
+                    delay_penalty = 0.1 * delay
+                    reward += self.reward_record.add_immediate(2.0 + on_time_bonus - delay_penalty)
 
-                    # Request 완료 보상 (Dropoff, 즉시 보상)
-                    reward += 0.5
                     info['is_pending'] = False
-
-                    # Request 완료 보상 (Pickup, 지연 보상)
                     info['has_delayed_reward'] = True
                     action_id = "{}_1".format(r.id)
                     info['action_id_list'] = [action_id]
                     info['reward'] = 0.5
 
-                    # Logging
                     v.num_serve += 1
 
         self.sync_state()
@@ -743,9 +736,7 @@ class RideSharingEnvironment:
                 r.status = RequestStatus.ACCEPTED
                 r.assigned_v_id = v.id
 
-                # Pickup 결정 보상 (최대 1점, 즉시 보상)
-                reward = 0.5 * (1 - pickup_duration / self.network.max_duration)
-                + 0.5 * (1 - r.waiting_time / cfg.MAX_WAIT_TIME)
+                reward += self.reward_record.add_decision(0.1)
 
                 # Logging
                 v.num_accept += 1
@@ -763,8 +754,7 @@ class RideSharingEnvironment:
                     r.waiting_time = self.curr_time - r.request_time  # 마지막 확정 업데이트
                     r.pickup_at = self.curr_time  # 마지막 확정 업데이트
 
-                    # Pickup 결정 즉시 완료 보상
-                    reward += 1
+                    reward += self.reward_record.add_immediate(0.3)
                     info['is_pending'] = False
 
             else:
@@ -776,12 +766,7 @@ class RideSharingEnvironment:
                 dropoff_duration = self.network.get_duration(v.curr_node, v.next_node)
                 v.target_arrival_time = self.curr_time + dropoff_duration
 
-                # Dropoff 결정 리워드 (즉시 보상)
-                in_vehicle_ratio = r.in_vehicle_time / cfg.MAX_INVEHICLE_TIME
-                if in_vehicle_ratio > 1:
-                    in_vehicle_ratio = 1
-                reward = 0.5 * (1 - dropoff_duration / self.network.max_duration)
-                + 0.5 * (1 - in_vehicle_ratio)
+                reward += self.reward_record.add_decision(0.1)
 
                 # 만약 Dropoff가 즉시 완료된다면
                 if v.curr_node == v.next_node:
@@ -800,14 +785,12 @@ class RideSharingEnvironment:
                     self.active_request_list.remove(r)
                     self.done_request_list.append(r)
 
-                    # Dropoff 결정 즉시 완료 보상
-                    reward += 1
-
-                    # Request 완료 보상 (Dropoff, 즉시 보상)
-                    reward += 0.5
+                    delay = max(0, self.curr_time - r.arrival_due)
+                    on_time_bonus = 0.3 if delay == 0 else 0.0
+                    delay_penalty = 0.1 * delay
+                    reward += self.reward_record.add_immediate(2.0 + on_time_bonus - delay_penalty)
                     info['is_pending'] = False
 
-                    # Request 완료 보상 (Pickup, 지연 보상)
                     info['has_delayed_reward'] = True
                     action_id = "{}_1".format(r.id)
                     info['action_id_list'] = [action_id]

@@ -2,7 +2,7 @@ import itertools
 
 MAX_NUM_VEHICLES = 4
 
-MAX_NUM_REQUEST = 12
+MAX_NUM_REQUEST = 20
 VEH_CAPACITY = 5
 MAX_WAIT_TIME = 10
 MAX_INVEHICLE_TIME = 10
@@ -31,13 +31,13 @@ param_grid = {
     # "hidden_dim": [64, 128, 256],
     "hidden_dim": [256],
     # "batch_size": [32, 64, 128]
-    "batch_size": [64],
+    "batch_size": [128],
     "ppo_batch_size": [128],
     # "learning_rate": [1e-4, 1e-5, 1e-6]
     "learning_rate": [1e-5],  # 기본값 
     "critic_learning_rate": [3e-4],
     "actor_learning_rate": [5e-4],
-    "dqn_learning_rate": [1e-4],  # 더 공격적인 learning rate
+    "dqn_learning_rate": [5e-5],
     "mappo_learning_rate": [3e-4]  # MAPPO learning rate 추가
 }
 
