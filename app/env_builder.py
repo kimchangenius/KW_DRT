@@ -11,7 +11,7 @@ class EnvBuilder:
         self.data_dir = data_dir
         self.result_dir = result_dir
 
-        self.request_path = os.path.join(data_dir, 'requests_8.csv')
+        self.request_path = os.path.join(data_dir, 'requests_80.csv')
         self.vehicle_pos_path = os.path.join(data_dir, 'vehicle_positions.csv')
         self.od_matrix_path = os.path.join(data_dir, 'od_matrix.csv')
 

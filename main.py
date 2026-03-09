@@ -170,6 +170,7 @@ def train_ddqn(env_builder, config, write_result=False):
 
             for pair in d_reward_list:
                 agent.confirm_and_remember(pair[0], pair[1])
+                total_reward += pair[1]
                 delayed_reward_confirm += 1
 
             if env.is_done():
@@ -392,7 +393,7 @@ def main():
     # test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
 
     for params in cfg.config_list:
-        train_ddqn(env_builder, params, write_result=False)
+        train_ddqn(env_builder, params, write_result=True)
 
 
 
