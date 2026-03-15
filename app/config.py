@@ -1,6 +1,6 @@
 import itertools
 
-MAX_NUM_VEHICLES = 2
+MAX_NUM_VEHICLES = 4
 
 MAX_NUM_REQUEST = 8
 VEH_CAPACITY = 5

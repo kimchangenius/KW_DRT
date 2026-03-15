@@ -74,7 +74,7 @@ def get_run_folder_name(config):
 
 
 def train_ddqn(env_builder, config, write_result=False):
-    episodes = 500
+    episodes = 700
     update_freq = 10
     final_train_steps = 5
 
