@@ -16,10 +16,12 @@ POSSIBLE_ACTION = MAX_NUM_REQUEST + 1
 param_grid = {
     # "hidden_dim": [64, 128, 256],
     "hidden_dim": [256],
-    # "batch_size": [32, 64, 128]
-    "batch_size": [32],
-    # "learning_rate": [1e-4, 1e-5, 1e-6]
-    "learning_rate": [1e-5]
+    # "mini_batch_size": [32, 64, 128],
+    "mini_batch_size": [64],
+    # pi_lr: Actor(Policy) 학습률 (표준 3e-4)
+    "pi_lr": [3e-4],
+    # vf_lr: Critic(Value) 학습률 (표준 1e-3)
+    "vf_lr": [1e-3]
 }
 
 keys = list(param_grid.keys())

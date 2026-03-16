@@ -3,183 +3,304 @@ import numpy as np
 import tensorflow as tf
 import app.config as cfg
 
-from app.pending_buffer import PendingBuffer
-from app.replay_buffer import ReplayBuffer
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, TimeDistributed, Lambda, Concatenate, RepeatVector, Reshape
+from tensorflow.keras.layers import (
+    Input, Dense, TimeDistributed, Lambda,
+    Concatenate, RepeatVector, Flatten
+)
 
 
-class DQNAgent:
-    def __init__(self, hidden_dim, batch_size, learning_rate):
+class PPOAgent:
+    def __init__(self, hidden_dim, pi_lr, vf_lr, mini_batch_size=64):
         self.hidden_dim = hidden_dim
-        self.batch_size = batch_size
-        self.learning_rate = learning_rate
+        self.pi_lr = pi_lr
+        self.vf_lr = vf_lr
+        self.mini_batch_size = mini_batch_size
 
-        self.model = self.build_model()
-        self.target_model = self.build_model()
-        self.target_model.set_weights(self.model.get_weights())
+        self.actor = self._build_actor()
+        self.critic = self._build_critic()
 
-        self.train_step = 0
-        self.update_target_freq = 500
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=pi_lr)
+        self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=vf_lr)
 
         self.gamma = 0.99
-        self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
+        self.lam = 0.95
+        self.clip_ratio = 0.2
+        self.entropy_coef = 0.01
+        self.ppo_epochs = 4
+        self.max_grad_norm = 0.5
 
-        self.replay_buffer = ReplayBuffer()
-        self.pending_buffer = PendingBuffer()
+        self.trajectory = []
+        self.pending_actions = {}
+
+        self.train_step = 0
+        self._flat_action_size = cfg.MAX_NUM_VEHICLES * cfg.POSSIBLE_ACTION
 
     def save_model(self, file_path):
-        self.model.save_weights(file_path)
-        print(f"Model weights saved at {file_path}")
+        actor_path = file_path.replace('.h5', '_actor.h5')
+        critic_path = file_path.replace('.h5', '_critic.h5')
+        self.actor.save_weights(actor_path)
+        self.critic.save_weights(critic_path)
+        print(f"Actor saved: {actor_path}")
+        print(f"Critic saved: {critic_path}")
 
     def load_model(self, file_path):
-        if os.path.exists(file_path):
-            self.model.load_weights(file_path)
-            self.target_model.set_weights(self.model.get_weights())
-            print(f"Model weights loaded at {file_path}")
+        actor_path = file_path.replace('.h5', '_actor.h5')
+        critic_path = file_path.replace('.h5', '_critic.h5')
+        if os.path.exists(actor_path):
+            self.actor.load_weights(actor_path)
+            print(f"Actor loaded: {actor_path}")
         else:
-            print(f"No model weights loaded at {file_path}")
+            print(f"No actor weights found: {actor_path}")
+        if os.path.exists(critic_path):
+            self.critic.load_weights(critic_path)
+            print(f"Critic loaded: {critic_path}")
+        else:
+            print(f"No critic weights found: {critic_path}")
 
-    def build_model(self):
-        vehicle_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")  # (B, V, Dv)
-        request_input = Input(shape=(cfg.MAX_NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")  # (B, R, Dr)
-        relation_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input") # (B, V, R, Drel)
+    def _build_actor(self):
+        vehicle_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")
+        request_input = Input(shape=(cfg.MAX_NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")
+        relation_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input")
 
-        v_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(vehicle_input)  # (B, V, H)
-        r_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(request_input)  # (B, R, H)
+        v_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(vehicle_input)
+        r_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(request_input)
 
-        v_expand = tf.expand_dims(v_embed, axis=2)  # (B, V, 1, H)
-        r_expand = tf.expand_dims(r_embed, axis=1)  # (B, 1, R, H)
+        v_expand = tf.expand_dims(v_embed, axis=2)
+        r_expand = tf.expand_dims(r_embed, axis=1)
 
-        v_tiled = tf.tile(v_expand, [1, 1, cfg.MAX_NUM_REQUEST, 1])  # (B, V, R, H)
-        r_tiled = tf.tile(r_expand, [1, cfg.MAX_NUM_VEHICLES, 1, 1])  # (B, V, R, H)
+        v_tiled = tf.tile(v_expand, [1, 1, cfg.MAX_NUM_REQUEST, 1])
+        r_tiled = tf.tile(r_expand, [1, cfg.MAX_NUM_VEHICLES, 1, 1])
 
-        # Broadcast concat to shape (B, V, R, 2H + Drel)
-        pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled, relation_input])  # (B, V, R, 2H + Drel)
+        pair_embed = Concatenate(axis=-1)([v_tiled, r_tiled, relation_input])
 
-        q_match = TimeDistributed(TimeDistributed(Dense(self.hidden_dim, activation='relu')))(pair_embed)  # (B, V, R, H)
-        q_match = TimeDistributed(TimeDistributed(Dense(1)))(q_match)  # (B, V, R, 1)
-        q_match = Lambda(lambda x: tf.squeeze(x, axis=-1))(q_match)  # (B, V, R)
+        logits_match = TimeDistributed(TimeDistributed(Dense(self.hidden_dim, activation='relu')))(pair_embed)
+        logits_match = TimeDistributed(TimeDistributed(Dense(1)))(logits_match)
+        logits_match = Lambda(lambda x: tf.squeeze(x, axis=-1))(logits_match)
 
-        r_summary = tf.reduce_mean(r_embed, axis=1)  # (B, H)
-        r_summary = RepeatVector(cfg.MAX_NUM_VEHICLES)(r_summary)  # (B, V, H)
-        reject_context = Concatenate(axis=-1)([v_embed, r_summary])  # (B, V, 2H)
+        r_summary = tf.reduce_mean(r_embed, axis=1)
+        r_summary = RepeatVector(cfg.MAX_NUM_VEHICLES)(r_summary)
+        reject_context = Concatenate(axis=-1)([v_embed, r_summary])
 
-        q_reject = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(reject_context)
-        q_reject = TimeDistributed(Dense(1))(q_reject)  # (B, V, 1)
+        logits_reject = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(reject_context)
+        logits_reject = TimeDistributed(Dense(1))(logits_reject)
 
-        # Concatenate along request dim → total 21 actions
-        q_total = Concatenate(axis=-1)([q_match, q_reject])  # (B, V, R+1)
+        policy_logits = Concatenate(axis=-1)([logits_match, logits_reject])  # (B, V, R+1)
 
-        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=q_total)
+        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=policy_logits)
+
+    def _build_critic(self):
+        vehicle_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.VEHICLE_INPUT_DIM), name="vehicle_input")
+        request_input = Input(shape=(cfg.MAX_NUM_REQUEST, cfg.REQUEST_INPUT_DIM), name="request_input")
+        relation_input = Input(shape=(cfg.MAX_NUM_VEHICLES, cfg.MAX_NUM_REQUEST, cfg.RELATION_INPUT_DIM), name="relation_input")
+
+        v_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(vehicle_input)
+        r_embed = TimeDistributed(Dense(self.hidden_dim, activation='relu'))(request_input)
+
+        v_flat = Flatten()(v_embed)
+        r_flat = Flatten()(r_embed)
+        rel_flat = Flatten()(relation_input)
+
+        combined = Concatenate()([v_flat, r_flat, rel_flat])
+        hidden = Dense(self.hidden_dim, activation='relu')(combined)
+        hidden = Dense(self.hidden_dim, activation='relu')(hidden)
+        value = Dense(1)(hidden)
+
+        return Model(inputs=[vehicle_input, request_input, relation_input], outputs=value)
+
+    def get_value(self, state):
+        value = self.critic.predict(state, verbose=0)
+        return float(value[0, 0])
 
     def act(self, state, action_mask):
-        info = {
-            'mode': None
-        }
-        if np.random.rand() < self.epsilon:
-            info['mode'] = 'explore'
-            valid_actions = tf.where(action_mask == 1)
-            rand_idx = tf.random.uniform(shape=(), maxval=tf.shape(valid_actions)[0], dtype=tf.int32)
-            rand_action = valid_actions[rand_idx]
-            rand_action = rand_action.numpy()
-            vehicle_idx = int(rand_action[0])
-            action_idx = int(rand_action[1])
-        else:
-            info['mode'] = 'exploit'
-            q_values = self.model.predict(state, verbose=0)
-            masked_q = tf.where(action_mask == 1, q_values, tf.constant(-1e2, dtype=tf.float32))
-            flat_idx = tf.argmax(tf.reshape(masked_q, (-1,))).numpy()
-            vehicle_idx = int(flat_idx // cfg.POSSIBLE_ACTION)
-            action_idx = int(flat_idx % cfg.POSSIBLE_ACTION)
+        info = {'mode': 'policy'}
+
+        logits = self.actor.predict(state, verbose=0)  # (1, V, A)
+        masked_logits = tf.where(
+            action_mask == 1, logits, tf.constant(-1e9, dtype=tf.float32)
+        )
+        flat_logits = tf.reshape(masked_logits, (1, -1))  # (1, V*A)
+
+        flat_action = tf.random.categorical(flat_logits, num_samples=1, dtype=tf.int32)
+        flat_idx = int(flat_action[0, 0].numpy())
+
+        vehicle_idx = flat_idx // cfg.POSSIBLE_ACTION
+        action_idx = flat_idx % cfg.POSSIBLE_ACTION
+
+        flat_log_probs = tf.nn.log_softmax(flat_logits, axis=-1)
+        info['log_prob'] = float(flat_log_probs[0, flat_idx].numpy())
+
         return [vehicle_idx, action_idx, info]
 
-    def decay_epsilon(self):
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-            self.epsilon = max(self.epsilon, self.epsilon_min)
-        # print(f"[Agent] Epsilon decayed to {self.epsilon:.4f}")
+    def act_greedy(self, state, action_mask):
+        info = {'mode': 'greedy'}
 
-    def remember(self, transition):
-        self.replay_buffer.append(transition)
+        logits = self.actor.predict(state, verbose=0)
+        masked_logits = tf.where(
+            action_mask == 1, logits, tf.constant(-1e9, dtype=tf.float32)
+        )
+        flat_logits = tf.reshape(masked_logits, (-1,))
+        flat_idx = int(tf.argmax(flat_logits).numpy())
 
-    def pending(self, transition):
-        action = transition[1]
-        action_id = action[2]['id']
-        self.pending_buffer.add(action_id, transition)
+        vehicle_idx = flat_idx // cfg.POSSIBLE_ACTION
+        action_idx = flat_idx % cfg.POSSIBLE_ACTION
 
-    def confirm_and_remember(self, action_id, reward):
-        transition = self.pending_buffer.confirm(action_id, reward)
-        if transition is not None:
-            self.remember(transition)
+        flat_log_probs = tf.nn.log_softmax(tf.reshape(masked_logits, (1, -1)), axis=-1)
+        info['log_prob'] = float(flat_log_probs[0, flat_idx].numpy())
 
-    def train(self):
-        if len(self.replay_buffer) < self.batch_size:
+        return [vehicle_idx, action_idx, info]
+
+    # ── Trajectory Management ──
+
+    def store_transition(self, state, action, reward, action_mask, log_prob, value, done=False):
+        self.trajectory.append({
+            'state': state,
+            'action': [action[0], action[1]],
+            'reward': reward,
+            'action_mask': action_mask,
+            'log_prob': log_prob,
+            'value': value,
+            'done': done,
+        })
+
+    def add_pending(self, action_id, traj_idx):
+        self.pending_actions[action_id] = traj_idx
+
+    def confirm_pending(self, action_id, reward):
+        traj_idx = self.pending_actions.pop(action_id, None)
+        if traj_idx is not None and traj_idx < len(self.trajectory):
+            self.trajectory[traj_idx]['reward'] += reward
+            return True
+        return False
+
+    def clear_trajectory(self):
+        self.trajectory = []
+        self.pending_actions.clear()
+
+    # ── GAE ──
+
+    def _compute_gae(self, last_value):
+        T = len(self.trajectory)
+        advantages = np.zeros(T, dtype=np.float32)
+        returns = np.zeros(T, dtype=np.float32)
+
+        gae = 0.0
+        next_value = last_value
+
+        for t in reversed(range(T)):
+            reward = self.trajectory[t]['reward']
+            value = self.trajectory[t]['value']
+            done = 1.0 if self.trajectory[t]['done'] else 0.0
+
+            delta = reward + self.gamma * next_value * (1.0 - done) - value
+            gae = delta + self.gamma * self.lam * (1.0 - done) * gae
+
+            advantages[t] = gae
+            returns[t] = gae + value
+            next_value = value
+
+        return advantages, returns
+
+    # ── PPO Training ──
+
+    def train(self, last_value=0.0):
+        T = len(self.trajectory)
+        if T == 0:
             return None
 
-        # print("\n\n================= Train : {} =================".format(self.train_step))
-        batch = self.replay_buffer.sample(self.batch_size)
+        advantages, returns = self._compute_gae(last_value)
 
-        # === Q(s', a')  ===
-        next_vehicle_tensor = np.array([b[3][0][0] for b in batch])
-        next_request_tensor = np.array([b[3][1][0] for b in batch])
-        next_relation_tensor = np.array([b[3][2][0] for b in batch])
-        next_states = [next_vehicle_tensor, next_request_tensor, next_relation_tensor]
+        adv_std = advantages.std()
+        if adv_std > 1e-8:
+            advantages = (advantages - advantages.mean()) / adv_std
 
-        next_q_values = self.target_model.predict(next_states, verbose=0)  # (B, V, A)
-        next_action_mask = np.array([b[5]['nm'] for b in batch])
-        masked_next_q_values = tf.where(next_action_mask == 1, next_q_values, tf.constant(-1e1, dtype=tf.float32))
-        max_next_q = np.max(masked_next_q_values, axis=(1, 2))
+        states_v = np.array([t['state'][0][0] for t in self.trajectory])
+        states_r = np.array([t['state'][1][0] for t in self.trajectory])
+        states_rel = np.array([t['state'][2][0] for t in self.trajectory])
+        old_log_probs = np.array([t['log_prob'] for t in self.trajectory], dtype=np.float32)
+        actions = np.array([t['action'] for t in self.trajectory], dtype=np.int32)
+        action_masks = np.array([t['action_mask'] for t in self.trajectory], dtype=np.float32)
 
-        rewards = np.array([b[2] for b in batch])
-        dones = np.array([b[4] for b in batch])
-        targets = rewards + self.gamma * max_next_q * (1 - dones)
+        total_loss = 0.0
+        num_updates = 0
 
-        # === Q(s, a)  ===
-        vehicle_tensor = np.array([b[0][0][0] for b in batch])  # (B, V, Dv)
-        request_tensor = np.array([b[0][1][0] for b in batch])  # (B, R, Dr)
-        relation_tensor = np.array([b[0][2][0] for b in batch])  # (B, V, R, Drel)
-        states = [vehicle_tensor, request_tensor, relation_tensor]
+        for _ in range(self.ppo_epochs):
+            indices = np.random.permutation(T)
 
-        # for name, tensor in zip(
-        #         ["vehicle", "request", "relation"],
-        #         states
-        # ):
-        #     print(f"{name}_tensor has NaN:", np.isnan(tensor).any())
-        #     print(f"{name}_tensor min/max:", np.min(tensor), np.max(tensor))
+            for start in range(0, T, self.mini_batch_size):
+                end = min(start + self.mini_batch_size, T)
+                mb_idx = indices[start:end]
+                mb_size = end - start
 
-        with tf.GradientTape() as tape:
-            q_values = self.model(states, training=True)
-            # print(q_values)
-            action_mask = np.array([b[5]['m'] for b in batch])
+                pad_count = self.mini_batch_size - mb_size
+                if pad_count > 0:
+                    pad_idx = np.tile(mb_idx[-1:], pad_count)  # 마지막 샘플 반복
+                    mb_idx = np.concatenate([mb_idx, pad_idx])
+                    mb_valid = np.concatenate([np.ones(mb_size, dtype=np.float32), np.zeros(pad_count, dtype=np.float32)])
+                else:
+                    mb_valid = np.ones(self.mini_batch_size, dtype=np.float32)
 
-            masked_q_values = tf.where(action_mask == 1, q_values, tf.constant(-1e1, dtype=tf.float32))
-            # print(masked_q_values)
+                mb_states = [states_v[mb_idx], states_r[mb_idx], states_rel[mb_idx]]
+                mb_actions = tf.constant(actions[mb_idx], dtype=tf.int32)
+                mb_old_lp = tf.constant(old_log_probs[mb_idx], dtype=tf.float32)
+                mb_adv = tf.constant(advantages[mb_idx], dtype=tf.float32)
+                mb_ret = tf.constant(returns[mb_idx], dtype=tf.float32)
+                mb_masks = tf.constant(action_masks[mb_idx], dtype=tf.float32)
+                mb_valid = tf.constant(mb_valid, dtype=tf.float32)
 
-            actions_raw = np.array([b[1] for b in batch])  # (B, 3)
-            actions = actions_raw[:, :2]  # (B, 2)
-            indices = tf.constant(actions, dtype=tf.int32)  # (B, 2)
-            batch_indices = tf.range(tf.shape(indices)[0], dtype=tf.int32)[:, tf.newaxis]  # (B, 1)
-            full_indices = tf.concat([batch_indices, indices], axis=1)  # (B, 3)
-            # print(full_indices)
+                # ── Actor ──
+                with tf.GradientTape() as actor_tape:
+                    logits = self.actor(mb_states, training=True)  # (mb, V, A)
+                    masked_logits = tf.where(
+                        mb_masks == 1, logits,
+                        tf.constant(-1e9, dtype=tf.float32)
+                    )
+                    flat_logits = tf.reshape(masked_logits, [-1, self._flat_action_size])
 
-            q_sa = tf.gather_nd(masked_q_values, full_indices)  # (B,)
-            # print("q_sa (before loss):", q_sa.numpy())
-            # print(q_sa.shape)
+                    flat_log_probs = tf.nn.log_softmax(flat_logits, axis=-1)
+                    flat_probs = tf.nn.softmax(flat_logits, axis=-1)
 
-            loss = tf.reduce_mean(tf.keras.losses.MSE(targets, q_sa))
-            grads = tape.gradient(loss, self.model.trainable_variables)
-            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+                    flat_act_idx = mb_actions[:, 0] * cfg.POSSIBLE_ACTION + mb_actions[:, 1]
+                    batch_idx = tf.range(self.mini_batch_size, dtype=tf.int32)
+                    gather_idx = tf.stack([batch_idx, flat_act_idx], axis=1)
+                    new_log_probs = tf.gather_nd(flat_log_probs, gather_idx)
 
-        # print("loss:", loss.numpy())  # 여기서 nan 나오면 원인 확정
-        # print("targets min/max:", np.min(targets), np.max(targets))
-        # print("q_sa min/max:", np.min(q_sa.numpy()), np.max(q_sa.numpy()))
+                    ratio = tf.exp(new_log_probs - mb_old_lp)
+                    clipped = tf.clip_by_value(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
+                    policy_loss_per_sample = -tf.minimum(ratio * mb_adv, clipped * mb_adv)
+                    policy_loss = tf.reduce_sum(policy_loss_per_sample * mb_valid) / (tf.reduce_sum(mb_valid) + 1e-8)
+
+                    safe_log = tf.where(flat_probs > 0, flat_log_probs, tf.zeros_like(flat_log_probs))
+                    entropy_per_sample = -tf.reduce_sum(flat_probs * safe_log, axis=-1)
+                    entropy_loss = -self.entropy_coef * tf.reduce_sum(entropy_per_sample * mb_valid) / (tf.reduce_sum(mb_valid) + 1e-8)
+
+                    actor_loss = policy_loss + entropy_loss
+
+                actor_grads = actor_tape.gradient(actor_loss, self.actor.trainable_variables)
+                actor_grads = [
+                    g if g is not None else tf.zeros_like(v)
+                    for g, v in zip(actor_grads, self.actor.trainable_variables)
+                ]
+                actor_grads, _ = tf.clip_by_global_norm(actor_grads, self.max_grad_norm)
+                self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
+
+                # ── Critic ──
+                with tf.GradientTape() as critic_tape:
+                    values = self.critic(mb_states, training=True)  # (mb, 1)
+                    values = tf.squeeze(values, axis=-1)
+                    critic_loss_per_sample = tf.square(mb_ret - values)
+                    critic_loss = tf.reduce_sum(critic_loss_per_sample * mb_valid) / (tf.reduce_sum(mb_valid) + 1e-8)
+
+                critic_grads = critic_tape.gradient(critic_loss, self.critic.trainable_variables)
+                critic_grads = [
+                    g if g is not None else tf.zeros_like(v)
+                    for g, v in zip(critic_grads, self.critic.trainable_variables)
+                ]
+                critic_grads, _ = tf.clip_by_global_norm(critic_grads, self.max_grad_norm)
+                self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
+
+                total_loss += (actor_loss.numpy() + critic_loss.numpy())
+                num_updates += 1
 
         self.train_step += 1
-        if self.train_step % self.update_target_freq == 0:
-            self.target_model.set_weights(self.model.get_weights())
-
-        return loss.numpy()
+        return total_loss / max(num_updates, 1)
