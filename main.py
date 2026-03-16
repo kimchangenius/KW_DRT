@@ -99,7 +99,6 @@ def train_ddqn(env_builder, config, write_result=False):
     best_reward = float('-inf')
 
     for ep in range(1, episodes + 1):
-        # print('\n============ Ep : {} ============'.format(ep))
         total_loss = 0.0
         total_reward = 0.0
         state = env.reset()
@@ -113,13 +112,7 @@ def train_ddqn(env_builder, config, write_result=False):
         start_time = time.time()
 
         while True:
-            # print('\n============ Time : {} ============'.format(env.curr_time))
-            # env.print_vehicles()
-            # env.print_active_requests()
-
             while env.has_idle_vehicle():
-                # print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
-
                 action_mask = env.get_action_mask()
                 action = agent.act(state, action_mask)
                 env.enrich_action(action)
@@ -133,10 +126,6 @@ def train_ddqn(env_builder, config, write_result=False):
 
                 next_state, reward, info = env.step(action)
                 next_action_mask = env.get_action_mask()
-
-                # print('Curr Reward: {}'.format(reward))
-                # env.print_vehicles()
-                # env.print_active_requests()
 
                 t_info = {
                     'id': transition_id,
@@ -186,11 +175,7 @@ def train_ddqn(env_builder, config, write_result=False):
 
                 if len(agent.pending_buffer) != 0:
                     print("[Warning] Pending Buffer is not empty!")
-                    # for k, v in agent.pending_buffer.pending.items():
-                    #     print(k)
-                    #     pprint(v)
                     agent.pending_buffer.clear()
-                # assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
 
                 drt_info_list = []
                 req_info_list = []
@@ -276,121 +261,9 @@ def train_ddqn(env_builder, config, write_result=False):
         log_all_episodes(run_path, e_info_list)
 
 
-def test_ddqn(env_builder, hidden_dim, model_name):
-    print(f"\n<<<< Test Session: {model_name} >>>>")
-
-    # Create Result Directory
-    run_name = model_name + "_test"
-    run_path = os.path.join(RESULT_PATH, run_name)
-    os.makedirs(run_path, exist_ok=True)
-
-    model_path = os.path.join(RESULT_PATH, model_name) + ".h5"
-
-    env = env_builder.build()
-    agent = DQNAgent(hidden_dim=hidden_dim, batch_size=0, learning_rate=0)
-    agent.load_model(model_path)
-    agent.epsilon = 0.0  # Deterministic
-
-    e_info_list = []
-
-    state = env.reset()
-    total_reward = 0
-
-    while True:
-        print('\n============ Time : {} ============'.format(env.curr_time))
-        env.print_vehicles()
-        env.print_active_requests()
-        while env.has_idle_vehicle():
-            print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
-            action_mask = env.get_action_mask()
-            print(action_mask)
-            action = agent.act(state, action_mask)
-            env.enrich_action(action)
-            next_state, reward, info = env.step(action)
-
-            print(reward)
-            env.print_vehicles()
-            env.print_active_requests()
-
-            total_reward += reward
-            state = next_state
-
-        env.curr_time += 1
-        env.handle_time_update()
-
-        if env.is_done():
-            drt_info_list = []
-            req_info_list = []
-            total_num_accept = 0
-            total_num_serve = 0
-            for v in env.vehicle_list:
-                total_num_accept += v.num_accept
-                total_num_serve += v.num_serve
-                v.on_service_driving_time = env.curr_time - v.idle_time
-                v_info = {
-                    'id': v.id,
-                    'num_accept': v.num_accept,
-                    'num_serve': v.num_serve,
-                    'idle_time': v.idle_time,
-                    'on_service_driving_time': v.on_service_driving_time
-                }
-                drt_info_list.append(v_info)
-
-            total_waiting_time = 0
-            total_in_vehicle_time = 0
-            total_detour_time = 0
-            served_count = 0
-            for r in env.done_request_list:
-                r.detour_time = r.in_vehicle_time - r.travel_time
-                if r.status == RequestStatus.SERVED:
-                    r_status = 'Served'
-                    served_count += 1
-                    total_waiting_time += r.waiting_time
-                    total_in_vehicle_time += r.in_vehicle_time
-                    total_detour_time += r.detour_time
-                else:
-                    r_status = 'Canceled'
-                r_info = {
-                    'id': r.id,
-                    'status': r_status,
-                    'waiting_time': r.waiting_time,
-                    'in_vehicle_time': r.in_vehicle_time,
-                    'detour_time': r.detour_time,
-                }
-                req_info_list.append(r_info)
-                req_info_list.sort(key=lambda x: x['id'])
-
-            mean_waiting_time = total_waiting_time / served_count if served_count else 0
-            mean_in_vehicle_time = total_in_vehicle_time / served_count if served_count else 0
-            mean_detour_time = total_detour_time / served_count if served_count else 0
-
-            print(f"[TEST] Ep: Test / Reward: {total_reward}")
-            e_info = {
-                'episode': 0,
-                'total_reward': total_reward,
-                'total_loss': 0,
-                'total_num_accept': total_num_accept,
-                'total_num_serve': total_num_serve,
-                'mean_waiting_time': mean_waiting_time,
-                'mean_in_vehicle_time': mean_in_vehicle_time,
-                'mean_detour_time': mean_detour_time,
-                'drt_info': drt_info_list,
-                'request_info': req_info_list
-            }
-            log_episode(run_path, e_info)
-            e_info_list.append(e_info)
-            break
-
-        env.sync_state()
-        state = env.state
-
-    log_all_episodes(run_path, e_info_list)
-
 
 def main():
     env_builder = EnvBuilder(data_dir=DATA_PATH, result_dir=RESULT_PATH)
-
-    # test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
 
     for params in cfg.config_list:
         train_ddqn(env_builder, params, write_result=True)
