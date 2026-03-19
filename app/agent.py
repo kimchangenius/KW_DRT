@@ -37,16 +37,15 @@ class PPOAgent:
         self._flat_action_size = cfg.MAX_NUM_VEHICLES * cfg.POSSIBLE_ACTION
 
     def save_model(self, file_path):
-        actor_path = file_path.replace('.h5', '_actor.h5')
-        critic_path = file_path.replace('.h5', '_critic.h5')
+        actor_path = file_path + "_actor.h5"
+        critic_path = file_path + "_critic.h5"
         self.actor.save_weights(actor_path)
         self.critic.save_weights(critic_path)
-        print(f"Actor saved: {actor_path}")
-        print(f"Critic saved: {critic_path}")
+        print(f"Model saved: {file_path}")
 
     def load_model(self, file_path):
-        actor_path = file_path.replace('.h5', '_actor.h5')
-        critic_path = file_path.replace('.h5', '_critic.h5')
+        actor_path = file_path + "_actor.h5"
+        critic_path = file_path + "_critic.h5"
         if os.path.exists(actor_path):
             self.actor.load_weights(actor_path)
             print(f"Actor loaded: {actor_path}")
@@ -224,21 +223,19 @@ class PPOAgent:
         total_loss = 0.0
         num_updates = 0
 
+        # Drop Last Batch: TRL/CleanRL 방식 - 마지막 불완전 배치 스킵으로 고정 shape 보장 (retracing 방지)
+        # 참고: Hugging Face TRL drop_last=True, CleanRL은 고정 batch_size로 항상 균등 분할
+        num_full_batches = T // self.mini_batch_size
+        if num_full_batches == 0:
+            return None  # trajectory가 mini_batch_size 미만이면 학습 스킵
+
         for _ in range(self.ppo_epochs):
             indices = np.random.permutation(T)
 
-            for start in range(0, T, self.mini_batch_size):
-                end = min(start + self.mini_batch_size, T)
+            for batch_i in range(num_full_batches):
+                start = batch_i * self.mini_batch_size
+                end = start + self.mini_batch_size
                 mb_idx = indices[start:end]
-                mb_size = end - start
-
-                pad_count = self.mini_batch_size - mb_size
-                if pad_count > 0:
-                    pad_idx = np.tile(mb_idx[-1:], pad_count)  # 마지막 샘플 반복
-                    mb_idx = np.concatenate([mb_idx, pad_idx])
-                    mb_valid = np.concatenate([np.ones(mb_size, dtype=np.float32), np.zeros(pad_count, dtype=np.float32)])
-                else:
-                    mb_valid = np.ones(self.mini_batch_size, dtype=np.float32)
 
                 mb_states = [states_v[mb_idx], states_r[mb_idx], states_rel[mb_idx]]
                 mb_actions = tf.constant(actions[mb_idx], dtype=tf.int32)
@@ -246,7 +243,6 @@ class PPOAgent:
                 mb_adv = tf.constant(advantages[mb_idx], dtype=tf.float32)
                 mb_ret = tf.constant(returns[mb_idx], dtype=tf.float32)
                 mb_masks = tf.constant(action_masks[mb_idx], dtype=tf.float32)
-                mb_valid = tf.constant(mb_valid, dtype=tf.float32)
 
                 # ── Actor ──
                 with tf.GradientTape() as actor_tape:
@@ -268,11 +264,11 @@ class PPOAgent:
                     ratio = tf.exp(new_log_probs - mb_old_lp)
                     clipped = tf.clip_by_value(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
                     policy_loss_per_sample = -tf.minimum(ratio * mb_adv, clipped * mb_adv)
-                    policy_loss = tf.reduce_sum(policy_loss_per_sample * mb_valid) / (tf.reduce_sum(mb_valid) + 1e-8)
+                    policy_loss = tf.reduce_mean(policy_loss_per_sample)
 
                     safe_log = tf.where(flat_probs > 0, flat_log_probs, tf.zeros_like(flat_log_probs))
                     entropy_per_sample = -tf.reduce_sum(flat_probs * safe_log, axis=-1)
-                    entropy_loss = -self.entropy_coef * tf.reduce_sum(entropy_per_sample * mb_valid) / (tf.reduce_sum(mb_valid) + 1e-8)
+                    entropy_loss = -self.entropy_coef * tf.reduce_mean(entropy_per_sample)
 
                     actor_loss = policy_loss + entropy_loss
 
@@ -289,7 +285,7 @@ class PPOAgent:
                     values = self.critic(mb_states, training=True)  # (mb, 1)
                     values = tf.squeeze(values, axis=-1)
                     critic_loss_per_sample = tf.square(mb_ret - values)
-                    critic_loss = tf.reduce_sum(critic_loss_per_sample * mb_valid) / (tf.reduce_sum(mb_valid) + 1e-8)
+                    critic_loss = tf.reduce_mean(critic_loss_per_sample)
 
                 critic_grads = critic_tape.gradient(critic_loss, self.critic.trainable_variables)
                 critic_grads = [
