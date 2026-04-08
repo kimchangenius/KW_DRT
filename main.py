@@ -1,9 +1,8 @@
 import os
 import csv
 import app.config as cfg
-from pprint import pprint
 from app.env_builder import EnvBuilder
-from app.agent import DQNAgent
+from app.agent import PPOAgent
 from app.request_status import RequestStatus
 from app.action_type import ActionType
 import time
@@ -68,99 +67,68 @@ def log_all_episodes(path, info_list):
 
 def get_run_folder_name(config):
     hd = config.get("hidden_dim", "x")
-    bs = config.get("batch_size", "x")
-    lr = config.get("learning_rate", "x")
-    return f"hd{hd}_bs{bs}_lr{lr}"
+    mbs = config.get("mini_batch_size", "x")
+    pi_lr = config.get("pi_lr", "x")
+    vf_lr = config.get("vf_lr", "x")
+    return f"hd{hd}_mbs{mbs}_pi{pi_lr}_vf{vf_lr}"
 
 
-def train_ddqn(env_builder, config, write_result=False):
-    episodes = 700
-    update_freq = 10
-    final_train_steps = 5
+def train_ppo(env_builder, config, write_result=False):
+    episodes = 1000
 
     config_str = ", ".join(f"{k}={v}" for k, v in config.items())
-    print(f"\n<<<< Training Session: {config_str} >>>>")
+    print(f"\n<<<< Training Session (PPO): {config_str} >>>>")
 
-    # Create Result Directory
-    if write_result is True:
+    if write_result:
         run_name = get_run_folder_name(config)
         run_path = os.path.join(RESULT_PATH, run_name)
         os.makedirs(run_path, exist_ok=True)
 
     hd = config["hidden_dim"]
-    bs = config["batch_size"]
-    lr = config["learning_rate"]
+    mbs = config["mini_batch_size"]
+    pi_lr = config["pi_lr"]
+    vf_lr = config["vf_lr"]
 
     env = env_builder.build()
-    agent = DQNAgent(hidden_dim=hd, batch_size=bs, learning_rate=lr)
+    agent = PPOAgent(hidden_dim=hd, pi_lr=pi_lr, vf_lr=vf_lr, mini_batch_size=mbs)
 
-    transition_id = 0
     e_info_list = []
     best_reward = float('-inf')
 
     for ep in range(1, episodes + 1):
-        # print('\n============ Ep : {} ============'.format(ep))
-        total_loss = 0.0
         total_reward = 0.0
+        total_loss = 0.0
         state = env.reset()
 
-        delayed_reward_confirm = 0
-
-        veh_event_list = []
-        for _ in range(len(env.vehicle_list)):
-            veh_event_list.append([])
+        veh_event_list = [[] for _ in range(len(env.vehicle_list))]
 
         start_time = time.time()
 
         while True:
-            # print('\n============ Time : {} ============'.format(env.curr_time))
-            # env.print_vehicles()
-            # env.print_active_requests()
-
             while env.has_idle_vehicle():
-                # print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
-
                 action_mask = env.get_action_mask()
                 action = agent.act(state, action_mask)
+                log_prob = action[2]['log_prob']
+                value = agent.get_value(state)
+
                 env.enrich_action(action)
                 if action[2]['type'] != ActionType.REJECT:
-                    at = 'D'
-                    if action[2]['type'] == ActionType.PICKUP:
-                        at = 'P'
+                    at = 'D' if action[2]['type'] == ActionType.DROPOFF else 'P'
                     seq = "{}_{}".format(at, action[2]['r_id'])
                     veh_event_list[action[0]].append(seq)
-                    # print(seq)
 
                 next_state, reward, info = env.step(action)
-                next_action_mask = env.get_action_mask()
 
-                # print('Curr Reward: {}'.format(reward))
-                # env.print_vehicles()
-                # env.print_active_requests()
+                traj_idx = len(agent.trajectory)
+                agent.store_transition(state, action, reward, action_mask, log_prob, value)
 
-                t_info = {
-                    'id': transition_id,
-                    'm': action_mask,
-                    'nm': next_action_mask,
-                }
+                if info['is_pending']:
+                    action_id = action[2]['id']
+                    agent.add_pending(action_id, traj_idx)
 
-                transition = [state, action, reward, next_state, False, t_info]
-                transition_id += 1
-                if info['is_pending'] is True:
-                    agent.pending(transition)
-                else:
-                    agent.remember(transition)
-
-                if info['has_delayed_reward'] is True:
+                if info['has_delayed_reward']:
                     for action_id in info['action_id_list']:
-                        d_reward = info['reward']
-                        agent.confirm_and_remember(action_id, d_reward)
-                        delayed_reward_confirm += 1
-
-                if env.curr_step % update_freq == 0:
-                    curr_loss = agent.train()
-                    if curr_loss is not None:
-                        total_loss += curr_loss
+                        agent.confirm_pending(action_id, info['reward'])
 
                 total_reward += reward
                 state = next_state
@@ -169,28 +137,22 @@ def train_ddqn(env_builder, config, write_result=False):
             d_reward_list = env.handle_time_update()
 
             for pair in d_reward_list:
-                agent.confirm_and_remember(pair[0], pair[1])
+                agent.confirm_pending(pair[0], pair[1])
                 total_reward += pair[1]
-                delayed_reward_confirm += 1
 
             if env.is_done():
-                # 마지막 transition의 done을 True로 변경
-                last_transition = agent.replay_buffer.get_last()
-                if last_transition is not None:
-                    last_transition[4] = True
+                if agent.trajectory:
+                    agent.trajectory[-1]['done'] = True
 
-                for _ in range(final_train_steps):
-                    curr_loss = agent.train()
-                    if curr_loss is not None:
-                        total_loss += curr_loss
+                last_value = agent.get_value(state)
+                loss = agent.train(last_value)
+                if loss is not None:
+                    total_loss = loss
 
-                if len(agent.pending_buffer) != 0:
-                    print("[Warning] Pending Buffer is not empty!")
-                    # for k, v in agent.pending_buffer.pending.items():
-                    #     print(k)
-                    #     pprint(v)
-                    agent.pending_buffer.clear()
-                # assert len(agent.pending_buffer) == 0, "Pending buffer is not empty"
+                if len(agent.pending_actions) != 0:
+                    print("[Warning] Pending actions not empty!")
+
+                agent.clear_trajectory()
 
                 drt_info_list = []
                 req_info_list = []
@@ -232,11 +194,12 @@ def train_ddqn(env_builder, config, write_result=False):
                     }
                     req_info_list.append(r_info)
                     req_info_list.sort(key=lambda x: x['id'])
-                mean_waiting_time = total_waiting_time / served_count
-                mean_in_vehicle_time = total_in_vehicle_time / served_count
-                mean_detour_time = total_detour_time / served_count
+                mean_waiting_time = total_waiting_time / served_count if served_count else 0
+                mean_in_vehicle_time = total_in_vehicle_time / served_count if served_count else 0
+                mean_detour_time = total_detour_time / served_count if served_count else 0
 
-                print('====== Ep: {} / Reward: {} / Loss: {} / eps: {} ======'.format(ep, total_reward, total_loss, agent.epsilon))
+                print('====== Ep: {} / Reward: {:.2f} / Loss: {:.4f} / Accept: {} / Serve: {} ======'.format(
+                    ep, total_reward, total_loss, total_num_accept, total_num_serve))
                 e_info = {
                     'episode': ep,
                     'total_reward': total_reward,
@@ -250,15 +213,14 @@ def train_ddqn(env_builder, config, write_result=False):
                     'drt_info': drt_info_list,
                     'request_info': req_info_list
                 }
-                if write_result is True:
+                if write_result:
                     log_episode(run_path, e_info)
                 e_info_list.append(e_info)
 
-                # Save Model
                 if total_reward > best_reward:
                     best_reward = total_reward
-                    if write_result is True:
-                        model_name = "{}.h5".format(get_run_folder_name(config))
+                    if write_result:
+                        model_name = get_run_folder_name(config)
                         model_path = os.path.join(RESULT_PATH, model_name)
                         agent.save_model(model_path)
 
@@ -270,131 +232,152 @@ def train_ddqn(env_builder, config, write_result=False):
         end_time = time.time()
         print(f"실행 시간: {end_time - start_time:.6f}초")
 
-        agent.decay_epsilon()
-
-    if write_result is True:
+    if write_result:
         log_all_episodes(run_path, e_info_list)
 
 
-def test_ddqn(env_builder, hidden_dim, model_name):
-    print(f"\n<<<< Test Session: {model_name} >>>>")
+def test_ppo(env_builder, config, write_result=False):
+    episodes = 1
 
-    # Create Result Directory
-    run_name = model_name + "_test"
-    run_path = os.path.join(RESULT_PATH, run_name)
-    os.makedirs(run_path, exist_ok=True)
+    config_str = ", ".join(f"{k}={v}" for k, v in config.items())
+    print(f"\n<<<< Test Session (PPO): {config_str} >>>>")
 
-    model_path = os.path.join(RESULT_PATH, model_name) + ".h5"
+    hd = config["hidden_dim"]
+    mbs = config.get("mini_batch_size", 64)
+    pi_lr = config.get("pi_lr", 3e-4)
+    vf_lr = config.get("vf_lr", 1e-3)
 
+    model_name = get_run_folder_name(config)
+    model_path = os.path.join(RESULT_PATH, model_name)
     env = env_builder.build()
-    agent = DQNAgent(hidden_dim=hidden_dim, batch_size=0, learning_rate=0)
+    agent = PPOAgent(hidden_dim=hd, pi_lr=pi_lr, vf_lr=vf_lr, mini_batch_size=mbs)
     agent.load_model(model_path)
-    agent.epsilon = 0.0  # Deterministic
 
     e_info_list = []
 
-    state = env.reset()
-    total_reward = 0
+    for ep in range(1, episodes + 1):
+        total_reward = 0.0
+        state = env.reset()
+        veh_event_list = [[] for _ in range(len(env.vehicle_list))]
 
-    while True:
-        print('\n============ Time : {} ============'.format(env.curr_time))
-        env.print_vehicles()
-        env.print_active_requests()
-        while env.has_idle_vehicle():
-            print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
-            action_mask = env.get_action_mask()
-            print(action_mask)
-            action = agent.act(state, action_mask)
-            env.enrich_action(action)
-            next_state, reward, info = env.step(action)
+        while True:
+            while env.has_idle_vehicle():
+                action_mask = env.get_action_mask()
+                action = agent.act_greedy(state, action_mask)
 
-            print(reward)
-            env.print_vehicles()
-            env.print_active_requests()
+                env.enrich_action(action)
+                if action[2]['type'] != ActionType.REJECT:
+                    at = 'D' if action[2]['type'] == ActionType.DROPOFF else 'P'
+                    seq = "{}_{}".format(at, action[2]['r_id'])
+                    veh_event_list[action[0]].append(seq)
 
-            total_reward += reward
-            state = next_state
+                next_state, reward, info = env.step(action)
+                total_reward += reward
+                state = next_state
 
-        env.curr_time += 1
-        env.handle_time_update()
+            env.curr_time += 1
+            env.handle_time_update()
 
-        if env.is_done():
-            drt_info_list = []
-            req_info_list = []
-            total_num_accept = 0
-            total_num_serve = 0
-            for v in env.vehicle_list:
-                total_num_accept += v.num_accept
-                total_num_serve += v.num_serve
-                v.on_service_driving_time = env.curr_time - v.idle_time
-                v_info = {
-                    'id': v.id,
-                    'num_accept': v.num_accept,
-                    'num_serve': v.num_serve,
-                    'idle_time': v.idle_time,
-                    'on_service_driving_time': v.on_service_driving_time
+            if env.is_done():
+                drt_info_list = []
+                req_info_list = []
+                total_num_accept = 0
+                total_num_serve = 0
+                for v in env.vehicle_list:
+                    total_num_accept += v.num_accept
+                    total_num_serve += v.num_serve
+                    v.on_service_driving_time = env.curr_time - v.idle_time
+                    v_info = {
+                        'id': v.id,
+                        'num_accept': v.num_accept,
+                        'num_serve': v.num_serve,
+                        'idle_time': v.idle_time,
+                        'on_service_driving_time': v.on_service_driving_time
+                    }
+                    drt_info_list.append(v_info)
+
+                total_waiting_time = 0
+                total_in_vehicle_time = 0
+                total_detour_time = 0
+                served_count = 0
+                for r in env.done_request_list:
+                    r.detour_time = r.in_vehicle_time - r.travel_time
+                    if r.status == RequestStatus.SERVED:
+                        r_status = 'Served'
+                        served_count += 1
+                        total_waiting_time += r.waiting_time
+                        total_in_vehicle_time += r.in_vehicle_time
+                        total_detour_time += r.detour_time
+                    else:
+                        r_status = 'Canceled'
+                    r_info = {
+                        'id': r.id,
+                        'status': r_status,
+                        'waiting_time': r.waiting_time,
+                        'in_vehicle_time': r.in_vehicle_time,
+                        'detour_time': r.detour_time,
+                    }
+                    req_info_list.append(r_info)
+                    req_info_list.sort(key=lambda x: x['id'])
+                mean_waiting_time = total_waiting_time / served_count if served_count else 0
+                mean_in_vehicle_time = total_in_vehicle_time / served_count if served_count else 0
+                mean_detour_time = total_detour_time / served_count if served_count else 0
+
+                print('[Test] Ep: {} / Reward: {:.2f} / Accept: {} / Serve: {}'.format(
+                    ep, total_reward, total_num_accept, total_num_serve))
+
+                e_info = {
+                    'episode': ep,
+                    'total_reward': total_reward,
+                    'total_loss': 0.0,
+                    'total_num_accept': total_num_accept,
+                    'total_num_serve': total_num_serve,
+                    'mean_waiting_time': mean_waiting_time,
+                    'mean_in_vehicle_time': mean_in_vehicle_time,
+                    'mean_detour_time': mean_detour_time,
+                    'event_sequence': veh_event_list,
+                    'drt_info': drt_info_list,
+                    'request_info': req_info_list
                 }
-                drt_info_list.append(v_info)
+                if write_result:
+                    log_episode(run_path, e_info)
+                e_info_list.append(e_info)
+                break
 
-            total_waiting_time = 0
-            total_in_vehicle_time = 0
-            total_detour_time = 0
-            served_count = 0
-            for r in env.done_request_list:
-                r.detour_time = r.in_vehicle_time - r.travel_time
-                if r.status == RequestStatus.SERVED:
-                    r_status = 'Served'
-                    served_count += 1
-                    total_waiting_time += r.waiting_time
-                    total_in_vehicle_time += r.in_vehicle_time
-                    total_detour_time += r.detour_time
-                else:
-                    r_status = 'Canceled'
-                r_info = {
-                    'id': r.id,
-                    'status': r_status,
-                    'waiting_time': r.waiting_time,
-                    'in_vehicle_time': r.in_vehicle_time,
-                    'detour_time': r.detour_time,
-                }
-                req_info_list.append(r_info)
-                req_info_list.sort(key=lambda x: x['id'])
+            env.sync_state()
+            state = env.state
 
-            mean_waiting_time = total_waiting_time / served_count if served_count else 0
-            mean_in_vehicle_time = total_in_vehicle_time / served_count if served_count else 0
-            mean_detour_time = total_detour_time / served_count if served_count else 0
+    # 다수 에피소드 평균 성능 출력
+    n = len(e_info_list)
+    mean_reward = sum(e['total_reward'] for e in e_info_list) / n
+    mean_accept = sum(e['total_num_accept'] for e in e_info_list) / n
+    mean_serve = sum(e['total_num_serve'] for e in e_info_list) / n
+    mean_wait = sum(e['mean_waiting_time'] for e in e_info_list) / n
+    mean_inv = sum(e['mean_in_vehicle_time'] for e in e_info_list) / n
+    mean_detour = sum(e['mean_detour_time'] for e in e_info_list) / n
 
-            print(f"[TEST] Ep: Test / Reward: {total_reward}")
-            e_info = {
-                'episode': 0,
-                'total_reward': total_reward,
-                'total_loss': 0,
-                'total_num_accept': total_num_accept,
-                'total_num_serve': total_num_serve,
-                'mean_waiting_time': mean_waiting_time,
-                'mean_in_vehicle_time': mean_in_vehicle_time,
-                'mean_detour_time': mean_detour_time,
-                'drt_info': drt_info_list,
-                'request_info': req_info_list
-            }
-            log_episode(run_path, e_info)
-            e_info_list.append(e_info)
-            break
+    print("\n" + "=" * 50)
+    print(f"[PPO Evaluation] {episodes} episodes (act_greedy, deterministic)")
+    print(f"  Mean Reward: {mean_reward:.2f}")
+    print(f"  Mean Accept: {mean_accept:.1f}")
+    print(f"  Mean Serve: {mean_serve:.1f}")
+    print(f"  Mean Waiting Time: {mean_wait:.2f}")
+    print(f"  Mean In-Vehicle Time: {mean_inv:.2f}")
+    print(f"  Mean Detour Time: {mean_detour:.2f}")
+    print("=" * 50)
 
-        env.sync_state()
-        state = env.state
-
-    log_all_episodes(run_path, e_info_list)
+    if write_result:
+        log_all_episodes(run_path, e_info_list)
 
 
 def main():
     env_builder = EnvBuilder(data_dir=DATA_PATH, result_dir=RESULT_PATH)
 
-    # test_ddqn(env_builder, 128, "hd128_bs16_lr1e-06")
-
+    # 학습
     for params in cfg.config_list:
-        train_ddqn(env_builder, params, write_result=True)
+        # train_ppo(env_builder, params, write_result=True)
 
+        test_ppo(env_builder, params, write_result=False)
 
 
 if __name__ == "__main__":

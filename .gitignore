@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 result/*
 !result/.gitkeep
+app/__pycache__/
