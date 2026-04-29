@@ -330,6 +330,30 @@ class RideSharingEnvironment:
             all_list.append(v_row)
         return np.array(all_list, dtype=np.float32)
 
+    def has_dropoff_candidate(self):
+        for v in self.vehicle_list:
+            if v.status == VehicleStatus.IDLE and v.has_pickedup_request():
+                return True
+        return False
+
+    def get_dropoff_action_mask(self):
+        """
+        IDLE 차량 중 PICKEDUP 요청을 보유한 차량들의 DROPOFF 가능 액션만 1.
+        그 외 차량 행은 모두 0이어서 act()가 DROPOFF 결정만 내릴 수 있게 한다.
+        """
+        mask = np.zeros((cfg.MAX_NUM_VEHICLES, cfg.POSSIBLE_ACTION), dtype=np.float32)
+        for i, v in enumerate(self.vehicle_list):
+            if v.status != VehicleStatus.IDLE:
+                continue
+            if not v.has_pickedup_request():
+                continue
+            for j, r in enumerate(self.active_request_list):
+                if j >= cfg.MAX_NUM_REQUEST:
+                    break
+                if r in v.active_request_list and r.status == RequestStatus.PICKEDUP:
+                    mask[i, j] = 1
+        return mask
+
     def enrich_action(self, action):
         vehicle_idx = action[0]
         action_idx = action[1]

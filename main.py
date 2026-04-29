@@ -6,6 +6,7 @@ from app.env_builder import EnvBuilder
 from app.agent import DQNAgent
 from app.request_status import RequestStatus
 from app.action_type import ActionType
+from app.vehicle_status import VehicleStatus
 import time
 
 CURR_PATH = os.getcwd()
@@ -51,6 +52,7 @@ def log_all_episodes(path, info_list):
     with open(filepath, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Episode', 'Total Reward', 'Total Loss', 'Total Num. Accept', 'Total Num. Serve',
+                         'Total Num. Cancel',
                          'Mean Waiting Time', 'Mean In-Vehicle Time', 'Mean Detour Time'])
         for e in info_list:
             curr_row = [
@@ -59,6 +61,7 @@ def log_all_episodes(path, info_list):
                 f"{e['total_loss']:.2f}",
                 e['total_num_accept'],
                 e['total_num_serve'],
+                e['total_num_cancel'],
                 f"{e['mean_waiting_time']:.2f}",
                 f"{e['mean_in_vehicle_time']:.2f}",
                 f"{e['mean_detour_time']:.2f}"
@@ -118,52 +121,54 @@ def train_ddqn(env_builder, config, write_result=False):
             # env.print_active_requests()
 
             while env.has_idle_vehicle():
-                # print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
-
                 action_mask = env.get_action_mask()
-                action = agent.act(state, action_mask)
-                env.enrich_action(action)
-                if action[2]['type'] != ActionType.REJECT:
-                    at = 'D'
-                    if action[2]['type'] == ActionType.PICKUP:
-                        at = 'P'
-                    seq = "{}_{}".format(at, action[2]['r_id'])
-                    veh_event_list[action[0]].append(seq)
-                    # print(seq)
+                actions = agent.act_pickup_assignments(state, action_mask, env)
+                if len(actions) == 0:
+                    break
+                    
+                for action in actions:
+                    r_obj = action[3] if len(action) > 3 else None
+                    if r_obj is not None:
+                        if r_obj not in env.active_request_list:
+                            continue
+                        action[1] = env.active_request_list.index(r_obj)
 
-                next_state, reward, info = env.step(action)
-                next_action_mask = env.get_action_mask()
+                    env.enrich_action(action)
+                    if action[2]['type'] != ActionType.REJECT:
+                        at = 'D'
+                        if action[2]['type'] == ActionType.PICKUP:
+                            at = 'P'
+                        seq = "{}_{}".format(at, action[2]['r_id'])
+                        veh_event_list[action[0]].append(seq)
 
-                # print('Curr Reward: {}'.format(reward))
-                # env.print_vehicles()
-                # env.print_active_requests()
+                    next_state, reward, info = env.step(action)
+                    next_action_mask = env.get_action_mask()
 
-                t_info = {
-                    'id': transition_id,
-                    'm': action_mask,
-                    'nm': next_action_mask,
-                }
+                    t_info = {
+                        'id': transition_id,
+                        'm': action_mask,
+                        'nm': next_action_mask,
+                    }
+                    transition = [state, action, reward, next_state, False, t_info]
+                    transition_id += 1
+                    if info['is_pending'] is True:
+                        agent.pending(transition)
+                    else:
+                        agent.remember(transition)
 
-                transition = [state, action, reward, next_state, False, t_info]
-                transition_id += 1
-                if info['is_pending'] is True:
-                    agent.pending(transition)
-                else:
-                    agent.remember(transition)
+                    if info['has_delayed_reward'] is True:
+                        for action_id in info['action_id_list']:
+                            d_reward = info['reward']
+                            agent.confirm_and_remember(action_id, d_reward)
+                            delayed_reward_confirm += 1
 
-                if info['has_delayed_reward'] is True:
-                    for action_id in info['action_id_list']:
-                        d_reward = info['reward']
-                        agent.confirm_and_remember(action_id, d_reward)
-                        delayed_reward_confirm += 1
+                    if env.curr_step % update_freq == 0:
+                        curr_loss = agent.train()
+                        if curr_loss is not None:
+                            total_loss += curr_loss
 
-                if env.curr_step % update_freq == 0:
-                    curr_loss = agent.train()
-                    if curr_loss is not None:
-                        total_loss += curr_loss
-
-                total_reward += reward
-                state = next_state
+                    total_reward += reward
+                    state = next_state
 
             env.curr_time += 1
             d_reward_list = env.handle_time_update()
@@ -213,6 +218,7 @@ def train_ddqn(env_builder, config, write_result=False):
                 total_in_vehicle_time = 0
                 total_detour_time = 0
                 served_count = 0
+                total_num_cancel = 0
                 for r in env.done_request_list:
                     r.detour_time = r.in_vehicle_time - r.travel_time
                     if r.status == RequestStatus.SERVED:
@@ -223,6 +229,7 @@ def train_ddqn(env_builder, config, write_result=False):
                         total_detour_time += r.detour_time
                     else:
                         r_status = 'Canceled'
+                        total_num_cancel += 1
                     r_info = {
                         'id': r.id,
                         'status': r_status,
@@ -232,9 +239,9 @@ def train_ddqn(env_builder, config, write_result=False):
                     }
                     req_info_list.append(r_info)
                     req_info_list.sort(key=lambda x: x['id'])
-                mean_waiting_time = total_waiting_time / served_count
-                mean_in_vehicle_time = total_in_vehicle_time / served_count
-                mean_detour_time = total_detour_time / served_count
+                mean_waiting_time = total_waiting_time / served_count if served_count else 0
+                mean_in_vehicle_time = total_in_vehicle_time / served_count if served_count else 0
+                mean_detour_time = total_detour_time / served_count if served_count else 0
 
                 print('====== Ep: {} / Reward: {} / Loss: {} / eps: {} ======'.format(ep, total_reward, total_loss, agent.epsilon))
                 e_info = {
@@ -243,6 +250,7 @@ def train_ddqn(env_builder, config, write_result=False):
                     'total_loss': total_loss,
                     'total_num_accept': total_num_accept,
                     'total_num_serve': total_num_serve,
+                    'total_num_cancel': total_num_cancel,
                     'mean_waiting_time': mean_waiting_time,
                     'mean_in_vehicle_time': mean_in_vehicle_time,
                     'mean_detour_time': mean_detour_time,
@@ -302,18 +310,29 @@ def test_ddqn(env_builder, hidden_dim, model_name):
         env.print_active_requests()
         while env.has_idle_vehicle():
             print('\n------------ Step : {} (Time : {}) ------------'.format(env.curr_step, env.curr_time))
+
             action_mask = env.get_action_mask()
             print(action_mask)
-            action = agent.act(state, action_mask)
-            env.enrich_action(action)
-            next_state, reward, info = env.step(action)
+            actions = agent.act_pickup_assignments(state, action_mask, env)
+            if len(actions) == 0:
+                break
 
-            print(reward)
-            env.print_vehicles()
-            env.print_active_requests()
+            for action in actions:
+                r_obj = action[3] if len(action) > 3 else None
+                if r_obj is not None:
+                    if r_obj not in env.active_request_list:
+                        continue
+                    action[1] = env.active_request_list.index(r_obj)
 
-            total_reward += reward
-            state = next_state
+                env.enrich_action(action)
+                next_state, reward, info = env.step(action)
+
+                print(reward)
+                env.print_vehicles()
+                env.print_active_requests()
+
+                total_reward += reward
+                state = next_state
 
         env.curr_time += 1
         env.handle_time_update()
@@ -340,6 +359,7 @@ def test_ddqn(env_builder, hidden_dim, model_name):
             total_in_vehicle_time = 0
             total_detour_time = 0
             served_count = 0
+            total_num_cancel = 0
             for r in env.done_request_list:
                 r.detour_time = r.in_vehicle_time - r.travel_time
                 if r.status == RequestStatus.SERVED:
@@ -350,6 +370,7 @@ def test_ddqn(env_builder, hidden_dim, model_name):
                     total_detour_time += r.detour_time
                 else:
                     r_status = 'Canceled'
+                    total_num_cancel += 1
                 r_info = {
                     'id': r.id,
                     'status': r_status,
@@ -371,6 +392,7 @@ def test_ddqn(env_builder, hidden_dim, model_name):
                 'total_loss': 0,
                 'total_num_accept': total_num_accept,
                 'total_num_serve': total_num_serve,
+                'total_num_cancel': total_num_cancel,
                 'mean_waiting_time': mean_waiting_time,
                 'mean_in_vehicle_time': mean_in_vehicle_time,
                 'mean_detour_time': mean_detour_time,

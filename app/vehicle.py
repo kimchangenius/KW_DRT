@@ -1,5 +1,6 @@
 import app.config as cfg
 
+from app.request_status import RequestStatus
 from app.vehicle_status import VehicleStatus, VEHICLE_STATUS_NUM_CLASSES
 
 
@@ -31,6 +32,12 @@ class Vehicle:
                 f"np={self.num_passengers} / "
                 f"active_r_num={len(self.active_request_list)})"
                 )
+
+    def has_pickedup_request(self):
+        for r in self.active_request_list:
+            if r.status == RequestStatus.PICKEDUP:
+                return True
+        return False
 
     def get_vector(self):
         num_nodes = self.network.num_nodes
