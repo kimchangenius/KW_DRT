@@ -7,11 +7,11 @@ from app.env import RideSharingEnvironment
 
 
 class EnvBuilder:
-    def __init__(self, data_dir, result_dir):
+    def __init__(self, data_dir, result_dir, request_filename='requests_80.csv'):
         self.data_dir = data_dir
         self.result_dir = result_dir
 
-        self.request_path = os.path.join(data_dir, 'requests_80.csv')
+        self.request_path = os.path.join(data_dir, request_filename)
         self.vehicle_pos_path = os.path.join(data_dir, 'vehicle_positions.csv')
         self.od_matrix_path = os.path.join(data_dir, 'od_matrix.csv')
 
@@ -20,12 +20,15 @@ class EnvBuilder:
         with open(self.request_path, newline='', encoding="utf-8-sig") as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
+                pop = row.get("Population")
+                num_passengers = int(pop) if pop not in (None, "") else 1
                 req = Request(
                     request_id=int(row["User_ID"]),
                     from_node_id=int(row["Start_node"]),
                     to_node_id=int(row["End_node"]),
                     request_time=int(row["Request_time"]),
-                    network=network
+                    network=network,
+                    num_passengers=num_passengers,
                 )
                 requests.append(req)
         return sorted(requests, key=lambda r: r.request_time)

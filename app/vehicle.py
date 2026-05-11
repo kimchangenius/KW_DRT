@@ -39,23 +39,18 @@ class Vehicle:
                 return True
         return False
 
-    def get_vector(self):
-        num_nodes = self.network.num_nodes
-
+    def get_static_features(self):
+        """노드 정보를 뺀 차량의 작은 raw feature 벡터.
+        status one-hot(4) + capacity(1) = VEHICLE_RAW_DIM=5"""
         vec_status = [0] * VEHICLE_STATUS_NUM_CLASSES
         if 1 <= self.status <= VEHICLE_STATUS_NUM_CLASSES:
             vec_status[self.status - 1] = 1
-
-        vec_from = [0] * num_nodes
-        if 1 <= self.curr_node <= num_nodes:
-            vec_from[self.curr_node - 1] = 1
-
-        vec_to = [0] * num_nodes
-        if 1 <= self.next_node <= num_nodes:
-            vec_to[self.next_node - 1] = 1
-
         vec_capa = [(cfg.VEH_CAPACITY - self.num_passengers) / cfg.VEH_CAPACITY]
+        return vec_status + vec_capa
 
-        vec_all = vec_status + vec_from + vec_to + vec_capa
-        return vec_all
+    def get_node_ids(self):
+        """노드 ID 튜플 (curr_node, next_node). 노드는 1..NUM_NODES, 0은 'no node'."""
+        curr = self.curr_node if 1 <= self.curr_node <= cfg.NUM_NODES else 0
+        nxt = self.next_node if 1 <= self.next_node <= cfg.NUM_NODES else 0
+        return [curr, nxt]
 

@@ -7,8 +7,9 @@ class Request:
     PICKUP_TOLERANCE_TIME = 10
     ARRIVAL_TOLERANCE_TIME = 20
 
-    def __init__(self, request_id, from_node_id, to_node_id, request_time, network):
-        self.num_passengers = 1
+    def __init__(self, request_id, from_node_id, to_node_id, request_time, network,
+                 num_passengers=1):
+        self.num_passengers = int(num_passengers)
 
         # 불변
         self.id = request_id
@@ -53,24 +54,21 @@ class Request:
         self.pickup_due = self.request_time + Request.PICKUP_TOLERANCE_TIME
         self.arrival_due = self.request_time + self.travel_time + Request.ARRIVAL_TOLERANCE_TIME
 
-    def get_vector(self):
-        num_nodes = self.network.num_nodes
-
+    def get_static_features(self):
+        """노드 정보를 뺀 요청의 작은 raw feature 벡터.
+        status(3) + passengers(1) + travel(1) + waiting(1) + arrival_due_left(1) = REQUEST_RAW_DIM=7"""
         vec_status = [0] * REQUEST_STATUS_NUM_CLASSES
         if 1 <= self.status <= REQUEST_STATUS_NUM_CLASSES:
             vec_status[self.status - 1] = 1
+        denom = (self.network.max_duration + Request.ARRIVAL_TOLERANCE_TIME)
+        vec_pass = [self.num_passengers / cfg.VEH_CAPACITY]
+        vec_travel = [self.travel_time / max(self.network.max_duration, 1)]
+        vec_wait = [max(0.0, self.waiting_time) / cfg.MAX_WAIT_TIME]
+        vec_due = [max(0, self.arrival_due_left) / max(denom, 1)]
+        return vec_status + vec_pass + vec_travel + vec_wait + vec_due
 
-        vec_from = [0] * num_nodes
-        if 1 <= self.from_node_id <= num_nodes:
-            vec_from[self.from_node_id - 1] = 1
-
-        vec_to = [0] * num_nodes
-        if 1 <= self.to_node_id <= num_nodes:
-            vec_to[self.to_node_id - 1] = 1
-
-        vec_passengers = [self.num_passengers / cfg.VEH_CAPACITY]
-        vec_travel = [self.travel_time / self.network.max_duration]
-        vec_wait = [self.waiting_time / cfg.MAX_WAIT_TIME]
-        vec_deadline = [self.arrival_due_left / (self.network.max_duration + Request.ARRIVAL_TOLERANCE_TIME)]
-        vec_all = vec_status + vec_from + vec_to + vec_passengers + vec_travel + vec_wait + vec_deadline
-        return vec_all
+    def get_node_ids(self):
+        """(from_node_id, to_node_id). 0은 'no node' 센티넬."""
+        f = self.from_node_id if 1 <= self.from_node_id <= cfg.NUM_NODES else 0
+        t = self.to_node_id if 1 <= self.to_node_id <= cfg.NUM_NODES else 0
+        return [f, t]
