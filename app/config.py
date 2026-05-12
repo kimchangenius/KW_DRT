@@ -10,7 +10,7 @@ MAX_WAIT_TIME = 10
 MAX_INVEHICLE_TIME = 10
 
 # waiting_time / detour_time 이 MAX_INVEHICLE_TIME 초과 시 (초과 step × scale) 페널티
-EXCESS_TIME_PENALTY_SCALE = 0.1
+EXCESS_TIME_PENALTY_SCALE = 0.05
 
 # 노드 ID는 1..NUM_NODES 사용. 0은 "no node" 센티넬 (Vehicle.next_node 등).
 NUM_NODES = 24

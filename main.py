@@ -101,11 +101,10 @@ def _next_pair_indices(env, vehicle_idx):
     if vehicle.status != VehicleStatus.IDLE:
         return []
 
-    real_cands = env.enumerate_pair_candidates([vehicle], include_wait=False)
-    if not real_cands.get(vehicle.id):
+    cands = env.enumerate_pair_candidates([vehicle], include_wait=True)
+    if not any(c.get('is_real', 0) for c in cands[vehicle.id]):
         return []
 
-    cands = env.enumerate_pair_candidates([vehicle], include_wait=True)
     out = []
     for c in cands[vehicle.id]:
         out.append({
@@ -316,10 +315,21 @@ def run_episode(
 
     while True:
         while env.has_idle_vehicle():
-            if not env.has_dispatch_candidate():
+            idle_vehicles = _idle_vehicles(env)
+            candidates_by_v = env.enumerate_pair_candidates(
+                idle_vehicles, include_wait=True
+            )
+            has_real_candidate = any(
+                c.get('is_real', 0)
+                for cand_list in candidates_by_v.values()
+                for c in cand_list
+            )
+            if not has_real_candidate:
                 break
             snapshot_pre = env.get_snapshot()
-            actions = agent.act_pickup_assignments(env, snapshot=snapshot_pre)
+            actions = agent.act_pickup_assignments(
+                env, snapshot=snapshot_pre, candidates_by_v=candidates_by_v
+            )
             if not actions:
                 break
 
@@ -361,7 +371,11 @@ def run_episode(
                     print("[Warning] Pending Buffer is not empty!")
                     agent.pending_buffer.clear()
 
-            mean_occupancy = occ_sum_pts / max(occ_snapshots, 1)
+            mean_occupancy = (
+                occ_sum_pts
+                / max(occ_snapshots, 1)
+                / max(cfg.MAX_NUM_VEHICLES, 1)
+            )
             e_info = summarize_episode(
                 env, episode, total_reward, total_loss,
                 mean_occupancy, veh_event_list,
@@ -374,8 +388,8 @@ def run_episode(
 # ===========================================================================
 def train_ddqn(env_builder, config, write_result=False):
     episodes = 700
-    update_freq = 10
-    final_train_steps = 5
+    update_freq = 25
+    final_train_steps = 10
 
     config_str = ", ".join(f"{k}={v}" for k, v in config.items())
     print(f"\n<<<< Training Session: {config_str} >>>>")

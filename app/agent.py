@@ -23,6 +23,20 @@ from tensorflow.keras.layers import Dense, Embedding
 from tensorflow.keras import mixed_precision
 
 
+def _configure_gpu_memory_growth():
+    """TensorFlow가 시작 시 GPU 메모리를 전부 선점하지 않도록 설정."""
+    gpus = tf.config.list_physical_devices('GPU')
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError:
+            # GPU runtime이 이미 초기화된 뒤라면 설정 변경이 불가능하다.
+            pass
+
+
+_configure_gpu_memory_growth()
+
+
 # ===========================================================================
 class MLPPairScorer(tf.keras.Model):
     def __init__(self, hidden_dim, edge_weight_np=None, **kwargs):
@@ -270,7 +284,15 @@ class DQNAgent:
     # -----------------------------------------------------------------------
     # 의사결정 (Hungarian + per-pair Q)
     # -----------------------------------------------------------------------
-    def act_pickup_assignments(self, env, snapshot=None):
+    @staticmethod
+    def _has_real_candidate(candidates_by_v):
+        return any(
+            c.get('is_real', 0)
+            for cand_list in candidates_by_v.values()
+            for c in cand_list
+        )
+
+    def act_pickup_assignments(self, env, snapshot=None, candidates_by_v=None):
         """
         IDLE 차량들에 대해 페어 후보를 enumerate해 (full-context) Q로 점수화한 뒤,
         Hungarian으로 PICKUP/DROPOFF/REJECT를 동시 결정.
@@ -283,15 +305,18 @@ class DQNAgent:
         idle_v = [v for v in env.vehicle_list if v.status == VehicleStatus.IDLE]
         if not idle_v:
             return []
-        if not env.has_dispatch_candidate():
-            return []
 
         # 1) snapshot이 미리 안 들어왔으면 그 자리에서 캡처
         if snapshot is None:
             snapshot = env.get_snapshot()
 
         # 2) 페어 후보 enumerate
-        candidates_by_v = env.enumerate_pair_candidates(idle_v, include_wait=True)
+        if candidates_by_v is None:
+            candidates_by_v = env.enumerate_pair_candidates(
+                idle_v, include_wait=True
+            )
+        if not self._has_real_candidate(candidates_by_v):
+            return []
 
         flat_pairs = []      # (v_idx, r_slot_idx, is_reject, rel_feat)
         flat_meta = []       # (idle_row_idx, candidate dict)
