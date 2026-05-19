@@ -8,6 +8,11 @@ from app.agent import DQNAgent
 from app.request_status import RequestStatus
 from app.action_type import ActionType
 from app.vehicle_status import VehicleStatus
+from app.state_builder import (
+    capture_replay_frame,
+    create_replay,
+    save_simulation_replay_json,
+)
 
 CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
@@ -303,7 +308,7 @@ def summarize_episode(env, episode, total_reward, total_loss, mean_occupancy,
 
 def run_episode(
     env, agent, episode=0, training=False, transition_id=0,
-    update_freq=10, final_train_steps=5,
+    update_freq=10, final_train_steps=5, replay=None, replay_config=None,
 ):
     total_loss = 0.0
     total_reward = 0.0
@@ -312,6 +317,7 @@ def run_episode(
     occ_sum_pts = float(_fleet_total_passengers(env))
     occ_snapshots = 1
     veh_event_list = [[] for _ in range(len(env.vehicle_list))]
+    capture_replay_frame(env, replay, replay_config)
 
     while True:
         while env.has_idle_vehicle():
@@ -350,6 +356,7 @@ def run_episode(
         d_reward_list = env.handle_time_update()
         occ_sum_pts += float(_fleet_total_passengers(env))
         occ_snapshots += 1
+        capture_replay_frame(env, replay, replay_config)
 
         if training:
             total_reward += _confirm_delayed_rewards(agent, d_reward_list)
@@ -462,10 +469,16 @@ def test_ddqn(env_builder, config):
     agent.load_model(model_path)
     agent.epsilon = 0.0
 
-    e_info, _ = run_episode(env, agent, episode=0, training=False)
+    replay = create_replay()
+    e_info, _ = run_episode(
+        env, agent, episode=0, training=False,
+        replay=replay, replay_config=config,
+    )
     print(f"[TEST] Reward: {e_info['total_reward']:.2f} / Served: {e_info['total_num_serve']}/{len(env.done_request_list)}")
     log_episode(run_path, e_info)
     log_all_episodes(run_path, [e_info])
+    json_path = save_simulation_replay_json(run_path, env, replay, config)
+    print(f"[TEST] simulation replay saved: {json_path}")
 
 
 # ===========================================================================
@@ -481,8 +494,8 @@ def main():
     )
 
     for params in cfg.config_list:
-        train_ddqn(env_builder, params, write_result=True)
-        # test_ddqn(env_builder, params)
+        # train_ddqn(env_builder, params, write_result=True)
+        test_ddqn(env_builder, params)
 
 
 
