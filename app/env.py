@@ -1,5 +1,4 @@
 import copy
-import itertools
 import numpy as np
 import app.config as cfg
 
@@ -347,45 +346,126 @@ class RideSharingEnvironment:
     # -----------------------------------------------------------------------
     # Pair candidate enumeration
     # -----------------------------------------------------------------------
+    def _onboard_requests(self, vehicle):
+        return [
+            r for r in vehicle.active_request_list
+            if r.status == RequestStatus.PICKEDUP
+        ]
+
+    def _all_within_in_vehicle_limits(self, elapsed_by_request):
+        for r, elapsed in elapsed_by_request.items():
+            if float(elapsed) > self.in_vehicle_time_limit(r):
+                return False
+        return True
+
+    def _has_feasible_dropoff_sequence(self, start_node, elapsed_by_request):
+        """
+        start_node에서 출발해 남은 탑승 요청들을 모두 각 request별
+        travel_time + MAX_INVEHICLE_TIME 안에 하차시킬 순서가 있는지 검사한다.
+        """
+        if not elapsed_by_request:
+            return True
+        if not self._all_within_in_vehicle_limits(elapsed_by_request):
+            return False
+
+        requests = tuple(elapsed_by_request.keys())
+        limits = {r: self.in_vehicle_time_limit(r) for r in requests}
+        memo = {}
+
+        def search(curr_node, remaining, elapsed_values):
+            if not remaining:
+                return True
+            key = (
+                curr_node,
+                tuple(r.id for r in remaining),
+                tuple(float(v) for v in elapsed_values),
+            )
+            if key in memo:
+                return memo[key]
+
+            drop_order = sorted(
+                range(len(remaining)),
+                key=lambda idx: (
+                    limits[remaining[idx]]
+                    - (
+                        float(elapsed_values[idx])
+                        + float(self.network.get_duration(
+                            curr_node,
+                            remaining[idx].to_node_id,
+                        ))
+                    )
+                ),
+            )
+            for idx in drop_order:
+                drop_r = remaining[idx]
+                dur = self.network.get_duration(curr_node, drop_r.to_node_id)
+                next_elapsed = tuple(float(v) + float(dur) for v in elapsed_values)
+                if any(
+                    next_elapsed[j] > limits[remaining[j]]
+                    for j in range(len(remaining))
+                ):
+                    continue
+                next_remaining = remaining[:idx] + remaining[idx + 1:]
+                next_elapsed_remaining = (
+                    next_elapsed[:idx] + next_elapsed[idx + 1:]
+                )
+                if search(
+                    drop_r.to_node_id,
+                    next_remaining,
+                    next_elapsed_remaining,
+                ):
+                    memo[key] = True
+                    return True
+
+            memo[key] = False
+            return False
+
+        elapsed_values = tuple(float(elapsed_by_request[r]) for r in requests)
+        return search(start_node, requests, elapsed_values)
+
     def _can_serve_after_pickup(self, vehicle, request, pickup_dur):
         """
         vehicle이 request를 pickup하러 간 뒤, 현재 탑승 요청과 새 요청을 모두
-        MAX_INVEHICLE_TIME 안에 하차시킬 수 있는 dropoff 순서가 있는지 검사한다.
+        각 request별 travel_time + MAX_INVEHICLE_TIME 안에 하차시킬 수 있는지 검사한다.
         """
         onboard = [
             r for r in vehicle.active_request_list
             if r.status == RequestStatus.PICKEDUP
         ]
-        dropoff_requests = onboard + [request]
-        start_node = request.from_node_id
+        if not onboard:
+            direct_dur = self.network.get_duration(
+                request.from_node_id,
+                request.to_node_id,
+            )
+            return direct_dur <= self.in_vehicle_time_limit(request)
 
         initial_elapsed = {
             r: float(r.in_vehicle_time) + float(pickup_dur)
             for r in onboard
         }
         initial_elapsed[request] = 0.0
+        return self._has_feasible_dropoff_sequence(
+            request.from_node_id,
+            initial_elapsed,
+        )
 
-        for order in itertools.permutations(dropoff_requests):
-            curr_node = start_node
-            elapsed = dict(initial_elapsed)
-            feasible = True
+    def _can_dropoff_next(self, vehicle, request, dropoff_dur):
+        onboard = self._onboard_requests(vehicle)
+        elapsed = {
+            r: float(r.in_vehicle_time) + float(dropoff_dur)
+            for r in onboard
+        }
+        if not self._all_within_in_vehicle_limits(elapsed):
+            return False
+        elapsed.pop(request, None)
+        return self._has_feasible_dropoff_sequence(request.to_node_id, elapsed)
 
-            for drop_r in order:
-                dur = self.network.get_duration(curr_node, drop_r.to_node_id)
-                for r in list(elapsed):
-                    elapsed[r] += dur
-
-                if elapsed[drop_r] >= cfg.MAX_INVEHICLE_TIME:
-                    feasible = False
-                    break
-
-                del elapsed[drop_r]
-                curr_node = drop_r.to_node_id
-
-            if feasible:
-                return True
-
-        return False
+    def _can_wait_with_onboard_limits(self, vehicle, wait_time=1.0):
+        elapsed = {
+            r: float(r.in_vehicle_time) + float(wait_time)
+            for r in self._onboard_requests(vehicle)
+        }
+        return self._has_feasible_dropoff_sequence(vehicle.curr_node, elapsed)
 
     def enumerate_pair_candidates(self, idle_vehicles, include_wait=True):
         """
@@ -414,6 +494,7 @@ class RideSharingEnvironment:
         for v in idle_vehicles:
             v_feat = np.array(v.get_static_features(), dtype=np.float32)
             cands = []
+            fallback_dropoff_cands = []
 
             for slot_idx, r in enumerate(self.active_request_list):
                 if r.status == RequestStatus.PENDING:
@@ -448,7 +529,7 @@ class RideSharingEnvironment:
                         [1.0, dropoff_dur / max_dur if max_dur > 0 else 0.0],
                         dtype=np.float32,
                     )
-                    cands.append({
+                    cand = {
                         'v_idx': v.id,
                         'r': r,
                         'r_slot_idx': slot_idx,
@@ -458,9 +539,16 @@ class RideSharingEnvironment:
                         'v_feat': v_feat,
                         'r_feat': np.array(r.get_static_features(), dtype=np.float32),
                         'rel_feat': rel_feat,
-                    })
+                    }
+                    if self._can_dropoff_next(v, r, dropoff_dur):
+                        cands.append(cand)
+                    else:
+                        fallback_dropoff_cands.append(cand)
 
-            if include_wait:
+            if not any(c.get('is_real', 0) for c in cands) and fallback_dropoff_cands:
+                cands.extend(fallback_dropoff_cands)
+
+            if include_wait and self._can_wait_with_onboard_limits(v):
                 # WAIT 페어: ActionType.REJECT 값을 쓰되 의미는 no-op 차량 대기다.
                 # r_slot_idx 는 reject/null request gather 용 placeholder 0.
                 cands.append({
@@ -575,7 +663,8 @@ class RideSharingEnvironment:
             dropoff_duration = self.network.get_duration(v.curr_node, v.next_node)
             v.target_arrival_time = self.curr_time + dropoff_duration
 
-            in_vehicle_ratio = min(1.0, r.in_vehicle_time / cfg.MAX_INVEHICLE_TIME)
+            in_vehicle_limit = max(self.in_vehicle_time_limit(r), 1.0)
+            in_vehicle_ratio = min(1.0, r.in_vehicle_time / in_vehicle_limit)
             reward = (
                 0.5 * (1 - dropoff_duration / self.network.max_duration)
                 + 0.5 * (1 - in_vehicle_ratio)
@@ -626,6 +715,34 @@ class RideSharingEnvironment:
     # -----------------------------------------------------------------------
     def has_idle_vehicle(self):
         return any(v.status == VehicleStatus.IDLE for v in self.vehicle_list)
+
+    def in_vehicle_time_limit(self, request):
+        request_duration = getattr(request, 'travel_time', None)
+        if request_duration is None or request_duration < 0:
+            request_duration = self.network.get_duration(
+                request.from_node_id, request.to_node_id
+            )
+        return float(request_duration) + float(cfg.MAX_INVEHICLE_TIME)
+
+    def find_in_vehicle_time_violation(self):
+        requests = list(self.active_request_list) + list(self.done_request_list)
+        for r in requests:
+            if r.status not in (RequestStatus.PICKEDUP, RequestStatus.SERVED):
+                continue
+            if r.in_vehicle_time is None:
+                continue
+            limit = self.in_vehicle_time_limit(r)
+            if float(r.in_vehicle_time) > limit:
+                return {
+                    'request_id': r.id,
+                    'status': str(r.status),
+                    'request_duration': limit - float(cfg.MAX_INVEHICLE_TIME),
+                    'in_vehicle_time': float(r.in_vehicle_time),
+                    'limit': limit,
+                    'max_invehicle_time': cfg.MAX_INVEHICLE_TIME,
+                    'current_time': self.curr_time,
+                }
+        return None
 
     def is_done(self):
         return len(self.active_request_list) == 0 and len(self.future_request_list) == 0

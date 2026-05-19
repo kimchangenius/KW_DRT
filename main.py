@@ -306,9 +306,55 @@ def summarize_episode(env, episode, total_reward, total_loss, mean_occupancy,
     }
 
 
+def _episode_info_with_occupancy(env, episode, total_reward, total_loss,
+                                 occ_sum_pts, occ_snapshots, veh_event_list):
+    mean_occupancy = (
+        occ_sum_pts
+        / max(occ_snapshots, 1)
+        / max(cfg.MAX_NUM_VEHICLES, 1)
+    )
+    return summarize_episode(
+        env, episode, total_reward, total_loss,
+        mean_occupancy, veh_event_list,
+    )
+
+
+def _mark_last_transition_done(agent):
+    last_transition = agent.replay_buffer.get_last()
+    if last_transition is not None:
+        last_transition['done'] = True
+
+
+def _clear_pending_buffer(agent):
+    if len(agent.pending_buffer) != 0:
+        print("[Warning] Pending Buffer is not empty!")
+        agent.pending_buffer.clear()
+
+
+def _mark_training_stop(agent):
+    _mark_last_transition_done(agent)
+    _clear_pending_buffer(agent)
+
+
+def _stop_episode_for_in_vehicle_violation(
+    env, agent, episode, total_reward, total_loss,
+    occ_sum_pts, occ_snapshots, veh_event_list, violation,
+):
+    _mark_training_stop(agent)
+    e_info = _episode_info_with_occupancy(
+        env, episode, total_reward, total_loss,
+        occ_sum_pts, occ_snapshots, veh_event_list,
+    )
+    e_info['training_stopped'] = True
+    e_info['stop_reason'] = 'in_vehicle_time_limit'
+    e_info['stop_detail'] = violation
+    return e_info
+
+
 def run_episode(
     env, agent, episode=0, training=False, transition_id=0,
     update_freq=10, final_train_steps=5, replay=None, replay_config=None,
+    stop_on_in_vehicle_limit=False,
 ):
     total_loss = 0.0
     total_reward = 0.0
@@ -345,6 +391,15 @@ def run_episode(
             )
             total_reward += reward
 
+            if training and stop_on_in_vehicle_limit:
+                violation = env.find_in_vehicle_time_violation()
+                if violation:
+                    e_info = _stop_episode_for_in_vehicle_violation(
+                        env, agent, episode, total_reward, total_loss,
+                        occ_sum_pts, occ_snapshots, veh_event_list, violation,
+                    )
+                    return e_info, transition_id
+
             if training:
                 for step in train_steps:
                     if step % update_freq == 0:
@@ -363,29 +418,29 @@ def run_episode(
         else:
             total_reward += sum(reward for _, reward in d_reward_list)
 
+        if training and stop_on_in_vehicle_limit:
+            violation = env.find_in_vehicle_time_violation()
+            if violation:
+                e_info = _stop_episode_for_in_vehicle_violation(
+                    env, agent, episode, total_reward, total_loss,
+                    occ_sum_pts, occ_snapshots, veh_event_list, violation,
+                )
+                return e_info, transition_id
+
         if env.is_done():
             if training:
-                last_transition = agent.replay_buffer.get_last()
-                if last_transition is not None:
-                    last_transition['done'] = True
+                _mark_last_transition_done(agent)
 
                 for _ in range(final_train_steps):
                     curr_loss = agent.train()
                     if curr_loss is not None:
                         total_loss += curr_loss
 
-                if len(agent.pending_buffer) != 0:
-                    print("[Warning] Pending Buffer is not empty!")
-                    agent.pending_buffer.clear()
+                _clear_pending_buffer(agent)
 
-            mean_occupancy = (
-                occ_sum_pts
-                / max(occ_snapshots, 1)
-                / max(cfg.MAX_NUM_VEHICLES, 1)
-            )
-            e_info = summarize_episode(
+            e_info = _episode_info_with_occupancy(
                 env, episode, total_reward, total_loss,
-                mean_occupancy, veh_event_list,
+                occ_sum_pts, occ_snapshots, veh_event_list,
             )
             return e_info, transition_id
 
@@ -424,6 +479,7 @@ def train_ddqn(env_builder, config, write_result=False):
             env, agent, episode=ep, training=True,
             transition_id=transition_id, update_freq=update_freq,
             final_train_steps=final_train_steps,
+            stop_on_in_vehicle_limit=True,
         )
         e_info_list.append(e_info)
 
@@ -433,6 +489,17 @@ def train_ddqn(env_builder, config, write_result=False):
 
         if write_result:
             log_episode(run_path, e_info)
+
+        if e_info.get('training_stopped'):
+            detail = e_info.get('stop_detail', {})
+            print(
+                "[STOP] In-vehicle time limit exceeded: "
+                f"request={detail.get('request_id')} / "
+                f"request_duration={detail.get('request_duration')} / "
+                f"in_vehicle_time={detail.get('in_vehicle_time')} / "
+                f"limit={detail.get('limit')}"
+            )
+            break
 
         if e_info['total_reward'] > best_reward:
             best_reward = e_info['total_reward']
@@ -494,8 +561,8 @@ def main():
     )
 
     for params in cfg.config_list:
-        # train_ddqn(env_builder, params, write_result=True)
-        test_ddqn(env_builder, params)
+        train_ddqn(env_builder, params, write_result=True)
+        # test_ddqn(env_builder, params)
 
 
 
