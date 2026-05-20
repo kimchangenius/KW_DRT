@@ -125,6 +125,49 @@ def default_out(scenario, seed, n_req):
     return f"data/requests_{scenario}_seed{seed}_n{n_req}.csv"
 
 
+def scenario_request_filename(scenario, seed, n_req, t_horizon=None):
+    parts = [f"requests_{scenario}", f"seed{seed}", f"n{n_req}"]
+    if t_horizon is not None:
+        parts.append(f"h{t_horizon}")
+    return "_".join(parts) + ".csv"
+
+
+def generate_scenario_csv(
+    data_dir,
+    scenario="S1",
+    seed=0,
+    n_req=80,
+    t_horizon=60,
+    lambda_base=DEFAULT_LAMBDA_BASE,
+    lambda_high=DEFAULT_LAMBDA_HIGH,
+    pop_p=DEFAULT_POP_P,
+    od_filename="od_matrix.csv",
+    out_dir=None,
+    out_path=None,
+):
+    """main.py 등에서 바로 호출할 수 있는 시나리오 CSV 생성 헬퍼."""
+    od_path = os.path.join(data_dir, od_filename)
+    od_dict = load_od_dict(od_path)
+    rows = generate_scenario_rows(
+        scenario=scenario,
+        seed=seed,
+        n_req=n_req,
+        t_horizon=t_horizon,
+        od_dict=od_dict,
+        lambda_base=lambda_base,
+        lambda_high=lambda_high,
+        pop_p=pop_p,
+    )
+    if out_path is None:
+        out_dir = out_dir or data_dir
+        out_path = os.path.join(
+            out_dir,
+            scenario_request_filename(scenario, seed, n_req, t_horizon),
+        )
+    write_csv(rows, out_path)
+    return out_path
+
+
 def main():
     args = parse_args()
     od_dict = load_od_dict(args.od)

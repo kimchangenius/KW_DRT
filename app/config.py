@@ -58,3 +58,25 @@ config_list = [
     dict(zip(keys, combination))
     for combination in itertools.product(*values)
 ]
+
+# ===========================================================================
+# Scenario generation grid
+# ===========================================================================
+# main.py에서 학습/테스트 세션을 시작할 때 이 값으로 demand CSV를 자동 생성한다.
+scenario_param_grid = {
+    "scenario": ["S1"],
+    "scenario_seed": [0],
+    "n_req": [320],
+    "horizon": [240],
+    "lambda_base": [1.0],
+    "lambda_high": [6.0],
+    "pop_p": [0.75],
+}
+
+scenario_keys = list(scenario_param_grid.keys())
+scenario_values = list(scenario_param_grid.values())
+
+scenario_config_list = [
+    dict(zip(scenario_keys, combination))
+    for combination in itertools.product(*scenario_values)
+]

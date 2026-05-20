@@ -13,10 +13,12 @@ from app.state_builder import (
     create_replay,
     save_simulation_replay_json,
 )
+from scripts.gen_scenario_csv import generate_scenario_csv
 
 CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
 RESULT_PATH = os.path.join(CURR_PATH, 'result')
+GENERATED_SCENARIO_PATH = os.path.join(DATA_PATH, 'generated_scenarios')
 
 
 # ===========================================================================
@@ -84,7 +86,55 @@ def get_run_folder_name(config):
     hd = config.get("hidden_dim", "x")
     bs = config.get("batch_size", "x")
     lr = config.get("learning_rate", "x")
-    return f"hd{hd}_bs{bs}_lr{lr}"
+    scenario = config.get("scenario")
+    if scenario is None:
+        return f"hd{hd}_bs{bs}_lr{lr}"
+    seed = config.get("scenario_seed", config.get("seed", "x"))
+    n_req = config.get("n_req", "x")
+    horizon = config.get("horizon", "x")
+    return f"{scenario}_seed{seed}_n{n_req}_h{horizon}_hd{hd}_bs{bs}_lr{lr}"
+
+
+def prepare_scenario_env_builder(scenario_config):
+    scenario = scenario_config.get("scenario", "S1")
+    seed = int(scenario_config.get("scenario_seed", scenario_config.get("seed", 0)))
+    n_req = int(scenario_config.get("n_req", 80))
+    horizon = int(scenario_config.get("horizon", 60))
+    request_path = generate_scenario_csv(
+        data_dir=DATA_PATH,
+        scenario=scenario,
+        seed=seed,
+        n_req=n_req,
+        t_horizon=horizon,
+        lambda_base=float(scenario_config.get("lambda_base", 1.0)),
+        lambda_high=float(scenario_config.get("lambda_high", 6.0)),
+        pop_p=float(scenario_config.get("pop_p", 0.75)),
+        out_dir=GENERATED_SCENARIO_PATH,
+    )
+    request_filename = os.path.relpath(request_path, DATA_PATH)
+    print(f"[SCENARIO] generated demand file: {request_filename}")
+    return EnvBuilder(
+        data_dir=DATA_PATH,
+        result_dir=RESULT_PATH,
+        request_filename=request_filename,
+    )
+
+
+def get_test_model_path(config):
+    model_path = os.path.join(RESULT_PATH, f"{get_run_folder_name(config)}.h5")
+    if os.path.exists(model_path) or config.get("scenario") is None:
+        return model_path
+
+    legacy_config = {
+        "hidden_dim": config.get("hidden_dim", "x"),
+        "batch_size": config.get("batch_size", "x"),
+        "learning_rate": config.get("learning_rate", "x"),
+    }
+    legacy_path = os.path.join(RESULT_PATH, f"{get_run_folder_name(legacy_config)}.h5")
+    if os.path.exists(legacy_path):
+        print(f"[TEST] scenario model not found; using legacy model: {legacy_path}")
+        return legacy_path
+    return model_path
 
 
 # ===========================================================================
@@ -526,7 +576,7 @@ def test_ddqn(env_builder, config):
     run_path = os.path.join(RESULT_PATH, run_name, "_test")
     os.makedirs(run_path, exist_ok=True)
 
-    model_path = os.path.join(RESULT_PATH, f"{run_name}.h5")
+    model_path = get_test_model_path(config)
 
     env = env_builder.build()
     agent = DQNAgent(
@@ -552,17 +602,12 @@ def test_ddqn(env_builder, config):
 # Main
 # ===========================================================================
 def main():
-    # 학습용 수요 파일 — n=320 / horizon=240 시나리오로 학습
-    request_filename = "requests_S1_seed0_n320.csv"
-    # request_filename = "requests_S2_seed0_n320.csv"
-    env_builder = EnvBuilder(
-        data_dir=DATA_PATH, result_dir=RESULT_PATH,
-        request_filename=request_filename,
-    )
-
-    for params in cfg.config_list:
-        train_ddqn(env_builder, params, write_result=True)
-        # test_ddqn(env_builder, params)
+    for scenario_params in cfg.scenario_config_list:
+        for model_params in cfg.config_list:
+            params = {**model_params, **scenario_params}
+            env_builder = prepare_scenario_env_builder(params)
+            train_ddqn(env_builder, params, write_result=True)
+            # test_ddqn(env_builder, params)
 
 
 
