@@ -19,6 +19,25 @@ CURR_PATH = os.getcwd()
 DATA_PATH = os.path.join(CURR_PATH, 'data')
 RESULT_PATH = os.path.join(CURR_PATH, 'result')
 GENERATED_SCENARIO_PATH = os.path.join(DATA_PATH, 'generated_scenarios')
+TEST_SCENARIO_PATH = os.path.join(DATA_PATH, 'test_scenarios')
+
+# 테스트에 사용할 모델 weight 경로를 직접 지정하려면 여기에 입력한다.
+# 예: TEST_MODEL_WEIGHT_PATH = os.path.join(RESULT_PATH, 'hd128_bs32_lr0.0001.h5')
+# None이면 config 기반 경로를 자동으로 찾는다.
+TEST_MODEL_WEIGHT_PATH = None
+
+TEST_METRIC_KEYS = [
+    'total_reward',
+    'total_loss',
+    'total_num_accept',
+    'total_num_serve',
+    'total_num_cancel',
+    'mean_waiting_time',
+    'mean_in_vehicle_time',
+    'mean_detour_time',
+    'mean_occupancy',
+    'service_rate',
+]
 
 
 # ===========================================================================
@@ -42,9 +61,15 @@ def log_episode(path, info):
     filepath = os.path.join(path, filename)
     with open(filepath, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Request ID', 'Status', 'Waiting Time', 'In-Vehicle Time', 'Detour Time'])
+        writer.writerow([
+            'Request ID', 'Status', 'Waiting Time', 'In-Vehicle Time',
+            'Travel Time', 'Detour Time',
+        ])
         for r in req_info_list:
-            curr_row = [r['id'], r['status'], r['waiting_time'], r['in_vehicle_time'], r['detour_time']]
+            curr_row = [
+                r['id'], r['status'], r['waiting_time'], r['in_vehicle_time'],
+                r['travel_time'], r['detour_time'],
+            ]
             writer.writerow(curr_row)
 
     seq_list = info.get('event_sequence', [])
@@ -82,6 +107,76 @@ def log_all_episodes(path, info_list):
             writer.writerow(curr_row)
 
 
+def _service_rate(info):
+    denom = info['total_num_serve'] + info['total_num_cancel']
+    return info['total_num_serve'] / denom if denom else 0.0
+
+
+def _fmt_metric(value):
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return value
+
+
+def _test_metric_row(info, scenario, seed):
+    row = {
+        'scenario': scenario,
+        'seed': seed,
+        'episode': info['episode'],
+        'total_reward': info['total_reward'],
+        'total_loss': info['total_loss'],
+        'total_num_accept': info['total_num_accept'],
+        'total_num_serve': info['total_num_serve'],
+        'total_num_cancel': info['total_num_cancel'],
+        'mean_waiting_time': info['mean_waiting_time'],
+        'mean_in_vehicle_time': info['mean_in_vehicle_time'],
+        'mean_detour_time': info['mean_detour_time'],
+        'mean_occupancy': info['mean_occupancy'],
+        'service_rate': _service_rate(info),
+    }
+    return row
+
+
+def _average_test_metric_row(scenario, rows):
+    out = {'scenario': scenario, 'num_seeds': len(rows)}
+    for key in TEST_METRIC_KEYS:
+        values = [float(row[key]) for row in rows]
+        out[f'avg_{key}'] = sum(values) / len(values) if values else 0.0
+    return out
+
+
+def log_test_seed_metrics(path, rows, filename='seed_metrics.csv'):
+    os.makedirs(path, exist_ok=True)
+    filepath = os.path.join(path, filename)
+    fieldnames = ['scenario', 'seed', 'episode'] + TEST_METRIC_KEYS
+    with open(filepath, mode='w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                key: _fmt_metric(row[key])
+                for key in fieldnames
+            })
+    return filepath
+
+
+def log_test_scenario_averages(path, rows, filename='scenario_average_metrics.csv'):
+    os.makedirs(path, exist_ok=True)
+    filepath = os.path.join(path, filename)
+    fieldnames = ['scenario', 'num_seeds'] + [
+        f'avg_{key}' for key in TEST_METRIC_KEYS
+    ]
+    with open(filepath, mode='w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                key: _fmt_metric(row[key])
+                for key in fieldnames
+            })
+    return filepath
+
+
 def get_run_folder_name(config):
     hd = config.get("hidden_dim", "x")
     bs = config.get("batch_size", "x")
@@ -117,6 +212,50 @@ def prepare_scenario_env_builder(scenario_config):
         data_dir=DATA_PATH,
         result_dir=RESULT_PATH,
         request_filename=request_filename,
+    )
+
+
+def _seed_from_test_filename(filename):
+    stem, ext = os.path.splitext(filename)
+    if ext != '.json' or not stem.startswith('seed_'):
+        return None
+    return int(stem.split('_', 1)[1])
+
+
+def iter_test_scenario_specs(scenarios=None, seeds=None):
+    scenarios = list(scenarios if scenarios is not None else cfg.TEST_SCENARIOS)
+    seed_set = None if seeds is None else {int(seed) for seed in seeds}
+
+    for scenario in scenarios:
+        scenario_dir = os.path.join(TEST_SCENARIO_PATH, scenario)
+        if not os.path.isdir(scenario_dir):
+            raise FileNotFoundError(f"Missing test scenario directory: {scenario_dir}")
+
+        specs = []
+        for filename in os.listdir(scenario_dir):
+            seed = _seed_from_test_filename(filename)
+            if seed is None:
+                continue
+            if seed_set is not None and seed not in seed_set:
+                continue
+            specs.append((seed, os.path.join(scenario_dir, filename)))
+
+        for seed, path in sorted(specs):
+            yield scenario, seed, path
+
+
+def prepare_test_scenario_env_builder(scenario, seed=None, episode_path=None):
+    if episode_path is None:
+        if seed is None:
+            raise ValueError("seed or episode_path is required for test scenario")
+        episode_path = os.path.join(TEST_SCENARIO_PATH, scenario, f"seed_{int(seed)}.json")
+    if not os.path.exists(episode_path):
+        raise FileNotFoundError(f"Missing test episode JSON: {episode_path}")
+    return EnvBuilder(
+        data_dir=DATA_PATH,
+        result_dir=RESULT_PATH,
+        test_episode_path=episode_path,
+        num_vehicles=cfg.MAX_NUM_VEHICLES,
     )
 
 
@@ -320,14 +459,15 @@ def summarize_episode(env, episode, total_reward, total_loss, mean_occupancy,
     served_count = 0
     total_num_cancel = 0
     for r in env.done_request_list:
-        r.detour_time = r.in_vehicle_time - r.travel_time
         if r.status == RequestStatus.SERVED:
+            r.detour_time = r.in_vehicle_time - r.travel_time
             r_status = 'Served'
             served_count += 1
             total_waiting_time += r.waiting_time
             total_in_vehicle_time += r.in_vehicle_time
             total_detour_time += r.detour_time
         else:
+            r.detour_time = 0
             r_status = 'Canceled'
             total_num_cancel += 1
         req_info_list.append({
@@ -335,6 +475,7 @@ def summarize_episode(env, episode, total_reward, total_loss, mean_occupancy,
             'status': r_status,
             'waiting_time': r.waiting_time,
             'in_vehicle_time': r.in_vehicle_time,
+            'travel_time': r.travel_time,
             'detour_time': r.detour_time,
         })
     req_info_list.sort(key=lambda x: x['id'])
@@ -547,7 +688,8 @@ def train_ddqn(env_builder, config, write_result=False):
                 f"request={detail.get('request_id')} / "
                 f"request_duration={detail.get('request_duration')} / "
                 f"in_vehicle_time={detail.get('in_vehicle_time')} / "
-                f"limit={detail.get('limit')}"
+                f"limit={detail.get('limit')} / "
+                f"current_time={detail.get('current_time')}"
             )
             break
 
@@ -569,33 +711,150 @@ def train_ddqn(env_builder, config, write_result=False):
 # ===========================================================================
 # Test loop
 # ===========================================================================
-def test_ddqn(env_builder, config):
-    print(f"\n<<<< Test Session: {config} >>>>")
-
-    run_name = get_run_folder_name(config)
-    run_path = os.path.join(RESULT_PATH, run_name, "_test")
-    os.makedirs(run_path, exist_ok=True)
-
-    model_path = get_test_model_path(config)
-
-    env = env_builder.build()
+def _build_test_agent(env, config, model_config=None):
+    model_path = (
+        config.get("model_path")
+        or TEST_MODEL_WEIGHT_PATH
+        or get_test_model_path(model_config or config)
+    )
     agent = DQNAgent(
         hidden_dim=config["hidden_dim"], batch_size=0, learning_rate=0,
         edge_weight_np=env.network.edge_weight,
     )
     agent.load_model(model_path)
     agent.epsilon = 0.0
+    return agent, model_path
 
-    replay = create_replay()
+
+def _run_test_env(
+    env, agent, config, run_path=None, episode=0,
+    save_replay=True, write_episode_logs=True,
+):
+    if run_path is not None and (save_replay or write_episode_logs):
+        os.makedirs(run_path, exist_ok=True)
+
+    replay = create_replay() if save_replay else None
     e_info, _ = run_episode(
-        env, agent, episode=0, training=False,
+        env, agent, episode=episode, training=False,
         replay=replay, replay_config=config,
     )
-    print(f"[TEST] Reward: {e_info['total_reward']:.2f} / Served: {e_info['total_num_serve']}/{len(env.done_request_list)}")
-    log_episode(run_path, e_info)
-    log_all_episodes(run_path, [e_info])
-    json_path = save_simulation_replay_json(run_path, env, replay, config)
-    print(f"[TEST] simulation replay saved: {json_path}")
+    print(
+        f"[TEST] scenario={config.get('scenario')} seed={config.get('scenario_seed')} "
+        f"Reward: {e_info['total_reward']:.2f} / "
+        f"Served: {e_info['total_num_serve']}/{len(env.done_request_list)}"
+    )
+
+    if write_episode_logs and run_path is not None:
+        log_episode(run_path, e_info)
+        log_all_episodes(run_path, [e_info])
+    if save_replay and run_path is not None:
+        json_path = save_simulation_replay_json(run_path, env, replay, config)
+        print(f"[TEST] simulation replay saved: {json_path}")
+
+    return e_info
+
+
+def test_ddqn(
+    env_builder, config, model_config=None, run_path=None, episode=0,
+    save_replay=True, write_episode_logs=True,
+):
+    print(f"\n<<<< Test Session: {config} >>>>")
+
+    if run_path is None:
+        run_name = get_run_folder_name(config)
+        run_path = os.path.join(RESULT_PATH, run_name, "_test")
+
+    env = env_builder.build()
+    agent, _ = _build_test_agent(env, config, model_config=model_config)
+    return _run_test_env(
+        env, agent, config, run_path=run_path, episode=episode,
+        save_replay=save_replay, write_episode_logs=write_episode_logs,
+    )
+
+
+def test_ddqn_test_scenarios(
+    config, scenarios=None, seeds=None,
+    save_replays=False, write_episode_logs=False,
+):
+    specs = list(iter_test_scenario_specs(scenarios=scenarios, seeds=seeds))
+    if not specs:
+        raise ValueError("No test scenario JSON files matched the requested filters.")
+
+    model_config = dict(config)
+    parent_test_path = os.path.join(RESULT_PATH, "test_scenarios")
+    os.makedirs(parent_test_path, exist_ok=True)
+
+    agent = None
+    model_path = None
+    infos_by_scenario = {}
+    rows_by_scenario = {}
+    all_rows = []
+
+    for idx, (scenario, seed, episode_path) in enumerate(specs, start=1):
+        env_builder = prepare_test_scenario_env_builder(
+            scenario, seed=seed, episode_path=episode_path,
+        )
+        env = env_builder.build()
+        if agent is None:
+            agent, model_path = _build_test_agent(
+                env, config, model_config=model_config,
+            )
+            print(f"[TEST] model path: {model_path}")
+
+        metadata = env_builder.test_metadata or {}
+        test_config = dict(config)
+        test_config.update({
+            'scenario': scenario,
+            'scenario_seed': seed,
+            'n_req': len(env.original_request_list),
+            'horizon': metadata.get('horizon_minutes'),
+            'eval_mode': 'fixture',
+            'test_episode_path': os.path.relpath(episode_path, DATA_PATH),
+        })
+
+        print(f"[TEST] fixture {idx}/{len(specs)}: {scenario} seed={seed}")
+        seed_path = os.path.join(parent_test_path, scenario, f"seed_{seed}")
+        e_info = _run_test_env(
+            env, agent, test_config, run_path=seed_path, episode=seed,
+            save_replay=save_replays,
+            write_episode_logs=write_episode_logs,
+        )
+        e_info['scenario'] = scenario
+        e_info['seed'] = seed
+
+        row = _test_metric_row(e_info, scenario, seed)
+        infos_by_scenario.setdefault(scenario, []).append(e_info)
+        rows_by_scenario.setdefault(scenario, []).append(row)
+        all_rows.append(row)
+
+    average_rows = []
+    for scenario in sorted(rows_by_scenario):
+        scenario_path = os.path.join(parent_test_path, scenario)
+        os.makedirs(scenario_path, exist_ok=True)
+        log_all_episodes(scenario_path, infos_by_scenario[scenario])
+        log_test_seed_metrics(scenario_path, rows_by_scenario[scenario])
+
+        avg_row = _average_test_metric_row(scenario, rows_by_scenario[scenario])
+        average_rows.append(avg_row)
+        log_test_scenario_averages(
+            scenario_path, [avg_row], filename='average_metrics.csv'
+        )
+
+    all_seed_csv = log_test_seed_metrics(
+        parent_test_path, all_rows, filename='all_seed_metrics.csv'
+    )
+    avg_csv = log_test_scenario_averages(parent_test_path, average_rows)
+    print(f"[TEST] all seed metrics saved: {all_seed_csv}")
+    print(f"[TEST] scenario averages saved: {avg_csv}")
+    return average_rows
+
+
+def test_ddqn_multi_seed(config, seeds=None):
+    return test_ddqn_test_scenarios(
+        config,
+        scenarios=cfg.TEST_SCENARIOS,
+        seeds=seeds,
+    )
 
 
 # ===========================================================================
@@ -607,7 +866,7 @@ def main():
             params = {**model_params, **scenario_params}
             env_builder = prepare_scenario_env_builder(params)
             train_ddqn(env_builder, params, write_result=True)
-            # test_ddqn(env_builder, params)
+            # test_ddqn_test_scenarios(params)
 
 
 

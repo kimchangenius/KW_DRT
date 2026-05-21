@@ -5,7 +5,7 @@ import itertools
 # ===========================================================================
 MAX_NUM_VEHICLES = 4
 
-VEH_CAPACITY = 5
+VEH_CAPACITY = 6
 MAX_WAIT_TIME = 10
 MAX_INVEHICLE_TIME = 10
 
@@ -80,3 +80,7 @@ scenario_config_list = [
     dict(zip(scenario_keys, combination))
     for combination in itertools.product(*scenario_values)
 ]
+
+# 고정 평가 fixture: data/test_scenarios/S1~S4/seed_10000~10029.json
+TEST_SCENARIOS = ["S1", "S2", "S3", "S4"]
+TEST_SCENARIO_SEEDS = list(range(10000, 10030))

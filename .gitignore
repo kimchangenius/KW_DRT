@@ -7,3 +7,5 @@ __pycache__/
 .DS_Store
 result/*
 !result/.gitkeep
+/data/generated_scenarios/*
+/data/test_scenarios/*

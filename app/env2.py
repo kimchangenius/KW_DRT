@@ -11,6 +11,11 @@ from app.vehicle_status import VehicleStatus
 
 class RideSharingEnvironment:
     """
+    env2: occupancy 개선 실험용 reward shaping 버전.
+
+    env.py의 제약/후보 생성 로직은 유지하고, 보상만 승객 수와 탑승률을 더 직접
+    반영하도록 조정한다.
+
     상태 표현이 (V, R) 통째 텐서가 아니라, agent 쪽에서 (v, r) 페어 후보를
     enumerate_pair_candidates()로 받아 페어 단위 forward를 하는 구조.
 
@@ -42,6 +47,76 @@ class RideSharingEnvironment:
             return 0.0
         scale = getattr(cfg, 'EXCESS_TIME_PENALTY_SCALE', 0.1)
         return -scale * (v - c)
+
+    @staticmethod
+    def _clip01(value):
+        return max(0.0, min(1.0, float(value)))
+
+    def _load_ratio(self, passengers):
+        return self._clip01(float(passengers) / max(float(cfg.VEH_CAPACITY), 1.0))
+
+    def _passenger_ratio(self, request):
+        return self._load_ratio(getattr(request, 'num_passengers', 1))
+
+    def _distance_score(self, duration):
+        return self._clip01(
+            1.0 - float(duration) / max(float(self.network.max_duration), 1.0)
+        )
+
+    def _wait_score(self, request, extra_time=0.0):
+        waited = float(request.waiting_time) + float(extra_time)
+        return self._clip01(1.0 - waited / max(float(cfg.MAX_WAIT_TIME), 1.0))
+
+    def _deadline_score(self, request, in_vehicle_time=None):
+        if in_vehicle_time is None:
+            in_vehicle_time = request.in_vehicle_time
+        slack = self.in_vehicle_time_limit(request) - float(in_vehicle_time)
+        return self._clip01(slack / max(float(cfg.MAX_INVEHICLE_TIME), 1.0))
+
+    def _pickup_action_reward(self, vehicle, request, pickup_duration):
+        load_before = float(vehicle.num_passengers)
+        load_after = load_before + float(request.num_passengers)
+        share_bonus = 0.15 if load_before > 0 else 0.0
+        return (
+            0.25 * self._distance_score(pickup_duration)
+            + 0.15 * self._wait_score(request, pickup_duration)
+            + 0.35 * self._load_ratio(load_after)
+            + 0.20 * self._passenger_ratio(request)
+            + share_bonus
+        )
+
+    def _dropoff_action_reward(self, vehicle, request, dropoff_duration):
+        projected_in_vehicle = float(request.in_vehicle_time) + float(dropoff_duration)
+        return (
+            0.20 * self._distance_score(dropoff_duration)
+            + 0.25 * self._deadline_score(request, projected_in_vehicle)
+            + 0.25 * self._load_ratio(vehicle.num_passengers)
+            + 0.30 * self._passenger_ratio(request)
+        )
+
+    def _service_completion_reward(self, vehicle, request):
+        load_before_dropoff = vehicle.num_passengers
+        shared_bonus = (
+            0.25
+            if load_before_dropoff > getattr(request, 'num_passengers', 1)
+            else 0.0
+        )
+        return (
+            0.50
+            + 0.70 * self._passenger_ratio(request)
+            + 0.60 * self._load_ratio(load_before_dropoff)
+            + 0.25 * self._deadline_score(request, request.in_vehicle_time)
+            + shared_bonus
+        )
+
+    def _cancel_penalty(self, request):
+        return -(0.50 + 0.50 * self._passenger_ratio(request))
+
+    def _wait_action_penalty(self, vehicle):
+        return -(
+            0.02
+            + 0.03 * self._load_ratio(vehicle.num_passengers)
+        )
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -133,7 +208,7 @@ class RideSharingEnvironment:
                 if r.status == RequestStatus.CANCELLED:
                     v.active_request_list.remove(r)
                     p_action_id = "{}_{}".format(r.id, ActionType.PICKUP.value)
-                    d_reward_list.append([p_action_id, -1])
+                    d_reward_list.append([p_action_id, self._cancel_penalty(r)])
                 else:
                     v.num_passengers += r.num_passengers
                     assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
@@ -153,21 +228,24 @@ class RideSharingEnvironment:
                 v.next_node = 0
                 v.target_request = None
                 v.target_arrival_time = -1
-                v.active_request_list.remove(r)
-                v.num_passengers -= r.num_passengers
-                assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
                 r.status = RequestStatus.SERVED
                 r.arrival_due_left = max(0, r.arrival_due - self.curr_time)
                 r.in_vehicle_time = self.curr_time - r.pickup_at
                 r.dropoff_at = self.curr_time
+                service_reward = self._service_completion_reward(v, r)
+
+                v.active_request_list.remove(r)
+                v.num_passengers -= r.num_passengers
+                assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
+
                 self.active_request_list.remove(r)
                 self.done_request_list.append(r)
 
                 p_action_id = "{}_{}".format(r.id, ActionType.PICKUP.value)
                 d_action_id = "{}_{}".format(r.id, ActionType.DROPOFF.value)
-                d_reward_list.append([p_action_id, 0.5])
-                d_reward_list.append([d_action_id, 0.5])
+                d_reward_list.append([p_action_id, 0.40 * service_reward])
+                d_reward_list.append([d_action_id, 0.60 * service_reward])
                 detour = max(0.0, float(r.in_vehicle_time - r.travel_time))
                 dp = self._penalty_time_over_cap(detour, cfg.MAX_INVEHICLE_TIME)
                 if dp < 0:
@@ -197,7 +275,7 @@ class RideSharingEnvironment:
                         v.target_arrival_time = -1
                         v.active_request_list.remove(cr)
                         p_action_id = "{}_{}".format(cr.id, ActionType.PICKUP.value)
-                        d_reward_list.append([p_action_id, -1])
+                        d_reward_list.append([p_action_id, self._cancel_penalty(cr)])
                         break
             self.active_request_list.remove(cr)
             self.done_request_list.append(cr)
@@ -633,6 +711,7 @@ class RideSharingEnvironment:
         if atype == ActionType.REJECT:
             v.status = VehicleStatus.REJECT
             v.idle_time += 1
+            reward = self._wait_action_penalty(v)
 
         elif atype == ActionType.PICKUP:
             assert r is not None and r.status == RequestStatus.PENDING, "Invalid PICKUP target"
@@ -647,10 +726,7 @@ class RideSharingEnvironment:
             r.status = RequestStatus.ACCEPTED
             r.assigned_v_id = v.id
 
-            reward = (
-                0.5 * (1 - pickup_duration / self.network.max_duration)
-                + 0.5 * (1 - r.waiting_time / cfg.MAX_WAIT_TIME)
-            )
+            reward = self._pickup_action_reward(v, r, pickup_duration)
             v.num_accept += 1
 
             # 픽업이 즉시 완료되는 경우 (curr_node == from_node_id)
@@ -664,7 +740,7 @@ class RideSharingEnvironment:
                 r.status = RequestStatus.PICKEDUP
                 r.waiting_time = self.curr_time - r.request_time
                 r.pickup_at = self.curr_time
-                reward += 1
+                reward += 0.25 * self._load_ratio(v.num_passengers)
                 reward += self._penalty_time_over_cap(r.waiting_time, cfg.MAX_WAIT_TIME)
 
         elif atype == ActionType.DROPOFF:
@@ -676,12 +752,7 @@ class RideSharingEnvironment:
             dropoff_duration = self.network.get_duration(v.curr_node, v.next_node)
             v.target_arrival_time = self.curr_time + dropoff_duration
 
-            in_vehicle_limit = max(self.in_vehicle_time_limit(r), 1.0)
-            in_vehicle_ratio = min(1.0, r.in_vehicle_time / in_vehicle_limit)
-            reward = (
-                0.5 * (1 - dropoff_duration / self.network.max_duration)
-                + 0.5 * (1 - in_vehicle_ratio)
-            )
+            reward = self._dropoff_action_reward(v, r, dropoff_duration)
 
             # 즉시 dropoff 완료되는 경우
             if v.curr_node == v.next_node:
@@ -689,25 +760,27 @@ class RideSharingEnvironment:
                 v.next_node = 0
                 v.target_request = None
                 v.target_arrival_time = -1
-                v.active_request_list.remove(r)
-                v.num_passengers -= r.num_passengers
-                assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
 
                 r.status = RequestStatus.SERVED
                 r.arrival_due_left = max(0, r.arrival_due - self.curr_time)
                 r.in_vehicle_time = self.curr_time - r.pickup_at
                 r.dropoff_at = self.curr_time
+                service_reward = self._service_completion_reward(v, r)
+
+                v.active_request_list.remove(r)
+                v.num_passengers -= r.num_passengers
+                assert 0 <= v.num_passengers <= cfg.VEH_CAPACITY, "Invalid Capacity"
+
                 self.active_request_list.remove(r)
                 self.done_request_list.append(r)
 
-                reward += 1
-                reward += 0.5
+                reward += 0.60 * service_reward
                 info['is_pending'] = False
                 info['has_delayed_reward'] = True
                 info['action_id_list'] = ["{}_{}".format(r.id, ActionType.PICKUP.value)]
                 detour = max(0.0, float(r.in_vehicle_time - r.travel_time))
                 info['reward'] = (
-                    0.5
+                    0.40 * service_reward
                     + self._penalty_time_over_cap(detour, cfg.MAX_INVEHICLE_TIME)
                 )
 
