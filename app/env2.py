@@ -725,6 +725,7 @@ class RideSharingEnvironment:
 
             r.status = RequestStatus.ACCEPTED
             r.assigned_v_id = v.id
+            r.accepted_at = self.curr_time
 
             reward = self._pickup_action_reward(v, r, pickup_duration)
             v.num_accept += 1

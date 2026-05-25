@@ -25,7 +25,7 @@ class EnvBuilder:
             else None
         )
         self.vehicle_pos_path = os.path.join(data_dir, 'vehicle_positions.csv')
-        self.od_matrix_path = os.path.join(data_dir, 'od_matrix.csv')
+        self.od_matrix_path = os.path.join(data_dir, 'od_matrix_v2.csv')
 
     def load_requests(self, network):
         requests = []

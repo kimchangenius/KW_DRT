@@ -646,6 +646,7 @@ class RideSharingEnvironment:
 
             r.status = RequestStatus.ACCEPTED
             r.assigned_v_id = v.id
+            r.accepted_at = self.curr_time
 
             reward = (
                 0.5 * (1 - pickup_duration / self.network.max_duration)

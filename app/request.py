@@ -30,6 +30,7 @@ class Request:
         self.slot_idx = -1
 
         # 기록용
+        self.accepted_at = None
         self.detour_time = -1
         self.pickup_at = None
         self.dropoff_at = None
@@ -40,6 +41,7 @@ class Request:
                 f"status={self.status} / "
                 f"veh={self.assigned_v_id} / "
                 f"rt={self.request_time} / "
+                f"at={self.accepted_at} / "
                 f"wt={self.waiting_time} / "
                 f"ivt={self.in_vehicle_time} / "
                 f"odt={self.travel_time} / "

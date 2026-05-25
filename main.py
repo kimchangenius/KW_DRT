@@ -11,6 +11,7 @@ from app.vehicle_status import VehicleStatus
 from app.state_builder import (
     capture_replay_frame,
     create_replay,
+    save_operation_result_json,
     save_simulation_replay_json,
 )
 from scripts.gen_scenario_csv import generate_scenario_csv
@@ -750,6 +751,11 @@ def _run_test_env(
     if save_replay and run_path is not None:
         json_path = save_simulation_replay_json(run_path, env, replay, config)
         print(f"[TEST] simulation replay saved: {json_path}")
+    operation_dir = os.path.join(
+        RESULT_PATH, 'operation', str(config.get('scenario', 'unknown')),
+    )
+    operation_path = save_operation_result_json(operation_dir, env, config)
+    print(f"[TEST] operation result saved: {operation_path}")
 
     return e_info
 
@@ -774,7 +780,7 @@ def test_ddqn(
 
 def test_ddqn_test_scenarios(
     config, scenarios=None, seeds=None,
-    save_replays=False, write_episode_logs=False,
+    save_replays=True, write_episode_logs=False,
 ):
     specs = list(iter_test_scenario_specs(scenarios=scenarios, seeds=seeds))
     if not specs:
@@ -866,7 +872,7 @@ def main():
             params = {**model_params, **scenario_params}
             env_builder = prepare_scenario_env_builder(params)
             train_ddqn(env_builder, params, write_result=True)
-            # test_ddqn_test_scenarios(params)
+            test_ddqn_test_scenarios(params)
 
 
 
